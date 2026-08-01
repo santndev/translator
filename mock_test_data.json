@@ -1,8 +1,0 @@
-{
-  "incoming_speaker": {
-    "english_text": "We recently migrated our core payment backend to a microservices architecture on Kubernetes and reduced our cloud infrastructure cost by 35%."
-  },
-  "outgoing_mic": {
-    "english_text": "That is an impressive result! Did you face any challenges with pod auto-scaling or traffic spikes during the migration?"
-  }
-}
