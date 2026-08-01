@@ -5,7 +5,7 @@ Integrates UnderstandingWidget (Stream 1a, 1b) and SmartReplyWidget (Stream 2a, 
 import math
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QSlider, QGraphicsDropShadowEffect, QApplication
+    QPushButton, QSlider, QGraphicsDropShadowEffect, QApplication, QCheckBox
 )
 
 from PySide6.QtCore import Qt, QPoint, Signal
@@ -215,27 +215,39 @@ class OverlayWindow(QMainWindow):
         self.slider_opacity.valueChanged.connect(self.change_opacity)
         self.header_layout.addWidget(self.slider_opacity)
 
-        # Minimal Close Button
-        self.btn_close = QPushButton("✕", self)
-        self.btn_close.setFixedSize(24, 24)
-        self.btn_close.setCursor(Qt.PointingHandCursor)
-        self.btn_close.setToolTip("Close Overlay")
-        self.btn_close.setStyleSheet("""
-            QPushButton {
-                background-color: rgba(255, 255, 255, 0.08);
-                color: #A0AEC0;
-                border: none;
-                border-radius: 12px;
-                font-size: 11px;
-                font-weight: bold;
+        # Taskbar Icon Visibility Checkbox (Default: Unchecked -> App Icon visible on Taskbar)
+        self.chk_hide_taskbar = QCheckBox("Hide Taskbar", self)
+        self.chk_hide_taskbar.setChecked(False)
+        self.chk_hide_taskbar.setCursor(Qt.PointingHandCursor)
+        self.chk_hide_taskbar.setToolTip("Check to hide application icon from Windows Taskbar")
+        self.chk_hide_taskbar.setStyleSheet("""
+            QCheckBox {
+                color: #94A3B8;
+                font-size: 10px;
+                font-weight: 600;
+                spacing: 4px;
+                padding: 2px 4px;
             }
-            QPushButton:hover {
-                background-color: #EF4444;
-                color: white;
+            QCheckBox:hover {
+                color: #F1F5F9;
+            }
+            QCheckBox::indicator {
+                width: 12px;
+                height: 12px;
+                border-radius: 3px;
+                border: 1px solid rgba(255, 255, 255, 0.25);
+                background: rgba(255, 255, 255, 0.08);
+            }
+            QCheckBox::indicator:hover {
+                border-color: #10B981;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #10B981;
+                border-color: #10B981;
             }
         """)
-        self.btn_close.clicked.connect(self.close)
-        self.header_layout.addWidget(self.btn_close)
+        self.chk_hide_taskbar.toggled.connect(self.toggle_hide_taskbar)
+        self.header_layout.addWidget(self.chk_hide_taskbar)
 
         main_layout.addLayout(self.header_layout)
 
@@ -298,6 +310,18 @@ class OverlayWindow(QMainWindow):
 
     def change_opacity(self, value: int):
         self.setWindowOpacity(value / 100.0)
+
+    def toggle_hide_taskbar(self, hide: bool):
+        """Toggles hiding/showing app icon on Windows Taskbar."""
+        pos = self.pos()
+        size = self.size()
+        if hide:
+            self.setWindowFlags(Qt.Tool | Qt.WindowStaysOnTopHint)
+        else:
+            self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        self.resize(size)
+        self.move(pos)
+        self.show()
 
     # Window Dragging & Resizing Logic
     def resizeEvent(self, event):
