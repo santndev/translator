@@ -12,14 +12,23 @@ from core.audio_capturer import AudioCapturer
 from core.translator_engine import TranslatorEngine
 from core.smart_reply_engine import SmartReplyEngine
 from core.stt_engine import STTEngine
+import ctypes
 from tests.mock_audio_generator import MockAudioGenerator
 from utils.logger import logger
 
 # THEN IMPORT PYSIDE6
 from PySide6.QtWidgets import QApplication, QPushButton, QHBoxLayout
 from PySide6.QtCore import Qt, QLockFile, QDir
+from PySide6.QtGui import QIcon
 
 from gui.overlay_window import OverlayWindow
+
+# Windows Taskbar App ID setup for icon grouping and taskbar icon display
+if sys.platform == "win32":
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("translator.englishcallassistant.app.1.0")
+    except Exception:
+        pass
 
 class AppController:
     def __init__(self):
@@ -29,9 +38,15 @@ class AppController:
             logger.warning("Another instance of English Call Assistant is already running. Exiting.")
             sys.exit(0)
 
-
         self.app = QApplication(sys.argv)
         self.app.setApplicationName("English Call Assistant")
+
+        # Set App Icon
+        if os.path.exists(Config.ICON_PATH_ICO):
+            self.app.setWindowIcon(QIcon(Config.ICON_PATH_ICO))
+        elif os.path.exists(Config.ICON_PATH_PNG):
+            self.app.setWindowIcon(QIcon(Config.ICON_PATH_PNG))
+
         self.app.setQuitOnLastWindowClosed(True)
         self.overlay = OverlayWindow()
 

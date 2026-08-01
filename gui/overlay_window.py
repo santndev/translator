@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
 )
 
 from PySide6.QtCore import Qt, QPoint, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QIcon, QPixmap
 
 from config import Config
 from gui.components.understanding_widget import UnderstandingWidget
@@ -43,6 +43,11 @@ class OverlayWindow(QMainWindow):
     def init_window_flags(self):
         """Sets Window Title, Always-On-Top, and restores saved position & size."""
         self.setWindowTitle("English Call Assistant & Overlay")
+        if os.path.exists(Config.ICON_PATH_ICO):
+            self.setWindowIcon(QIcon(Config.ICON_PATH_ICO))
+        elif os.path.exists(Config.ICON_PATH_PNG):
+            self.setWindowIcon(QIcon(Config.ICON_PATH_PNG))
+
         self.setWindowFlags(
             Qt.Window |
             Qt.WindowStaysOnTopHint
@@ -124,6 +129,14 @@ class OverlayWindow(QMainWindow):
         st_layout = QHBoxLayout(self.status_title_box)
         st_layout.setContentsMargins(2, 0, 4, 0)
         st_layout.setSpacing(6)
+
+        # Mini App Icon Logo
+        icon_path = Config.ICON_PATH_PNG if os.path.exists(Config.ICON_PATH_PNG) else Config.ICON_PATH_ICO
+        if os.path.exists(icon_path):
+            lbl_icon = QLabel(self.status_title_box)
+            pix = QPixmap(icon_path).scaled(18, 18, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            lbl_icon.setPixmap(pix)
+            st_layout.addWidget(lbl_icon)
 
         self.dot_indicator = QLabel("●", self.status_title_box)
         self.dot_indicator.setStyleSheet("color: #10B981; font-size: 10px;")

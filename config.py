@@ -7,6 +7,9 @@ class Config:
     # --- App Info ---
     APP_NAME = "English Call Assistant & Overlay"
     VERSION = "1.0.0"
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    ICON_PATH_PNG = os.path.join(BASE_DIR, "assets", "app_icon.png")
+    ICON_PATH_ICO = os.path.join(BASE_DIR, "assets", "app_icon.ico")
 
     # --- API Keys ---
     # Optional API keys for ultra-fast cloud services (Gemini, Groq, OpenAI)
