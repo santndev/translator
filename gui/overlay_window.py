@@ -158,12 +158,6 @@ class OverlayWindow(QMainWindow):
         """)
         st_layout.addWidget(self.lbl_audio_wave)
         self.header_layout.addWidget(self.status_title_box)
-
-
-
-        # Note: main.py inserts self.btn_test at index 1 of header_layout
-
-
         self.header_layout.addStretch()
 
         # Lock Position Toggle Button

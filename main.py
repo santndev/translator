@@ -13,7 +13,6 @@ from core.translator_engine import TranslatorEngine
 from core.smart_reply_engine import SmartReplyEngine
 from core.stt_engine import STTEngine
 import ctypes
-from tests.mock_audio_generator import MockAudioGenerator
 from utils.logger import logger
 
 # THEN IMPORT PYSIDE6
@@ -62,8 +61,6 @@ class AppController:
             callback_partial_speech=self.on_partial_audio_received
         )
 
-        self.setup_mock_test_button()
-
     def on_audio_activity_event(self, is_capturing: bool, volume: float):
         """Emits thread-safe signal to update visual audio indicator on top bar."""
         self.overlay.signal_audio_activity.emit(is_capturing, volume)
@@ -74,37 +71,6 @@ class AppController:
             self.overlay.signal_stream1c.emit(partial_text.strip())
 
 
-
-
-
-
-    def setup_mock_test_button(self):
-        """Adds a 1-Click Mock Test Button to header bar for instant testing."""
-        self.btn_test = QPushButton("🧪 Run Mock Call Test", self.overlay)
-        self.btn_test.setCursor(Qt.PointingHandCursor)
-        self.btn_test.setStyleSheet("""
-            QPushButton {
-                background-color: rgba(124, 58, 237, 0.85);
-                color: #FFFFFF;
-                border: 1px solid rgba(139, 92, 246, 0.4);
-                border-radius: 6px;
-                padding: 3px 9px;
-                font-size: 10px;
-                font-weight: 700;
-            }
-            QPushButton:hover {
-                background-color: rgba(139, 92, 246, 0.95);
-            }
-            QPushButton:pressed {
-                background-color: #6D28D9;
-            }
-        """)
-        self.btn_test.clicked.connect(self.run_mock_call_simulation)
-        
-        # Insert into header layout
-        central_layout = self.overlay.central_widget.layout()
-        header_layout = central_layout.itemAt(0).layout()
-        header_layout.insertWidget(1, self.btn_test)
 
     def process_incoming_speech(self, english_text: str):
         """
@@ -151,14 +117,6 @@ class AppController:
         """Callback triggered when audio/speech is captured or injected."""
         if channel_type == "incoming":
             self.process_incoming_speech(text_payload)
-
-    def run_mock_call_simulation(self):
-        """Simulates 2 English audio streams for instant testing on UI."""
-        logger.info("Running 2-Channel Mock Audio Call Simulation...")
-        mock_spk = MockAudioGenerator.get_mock_speaker_audio()
-        
-        # Inject Speaker Audio (Other person asking technical question)
-        self.audio_capturer.inject_mock_audio(mock_spk["channel"], mock_spk["english_text"])
 
     def run(self):
         self.overlay.show()
