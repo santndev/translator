@@ -2,6 +2,7 @@
 
 import threading
 
+from config import Config
 from core.audio_capturer import AudioCapturer
 
 
@@ -24,6 +25,17 @@ class _ReadyPunctuationSTT:
 
     def transcribe_audio_pcm(self, *_args, **_kwargs):
         return "."
+
+
+class _ChannelAwareSTT:
+    is_ready = True
+
+    def __init__(self):
+        self.channels = None
+
+    def transcribe_audio_pcm(self, *_args, **kwargs):
+        self.channels = kwargs.get("channels")
+        return "this is my microphone"
 
 
 def _capturer_with(stt_engine, callback):
@@ -94,8 +106,53 @@ def test_vad_limits_use_real_device_rate_and_channel_count():
     )
 
     assert silence_chunks == 24
-    assert max_bytes == 48000 * 2 * 2 * 8
+    assert max_bytes == int(
+        48000 * 2 * 2 * Config.MAX_UTTERANCE_SECONDS
+    )
     assert minimum_bytes == int(48000 * 2 * 2 * 0.45)
+
+
+def test_microphone_channel_count_reaches_stt_engine():
+    stt = _ChannelAwareSTT()
+    received = []
+    capturer = _capturer_with(
+        stt,
+        lambda channel, text, raw: received.append((channel, text)),
+    )
+
+    capturer._process_captured_audio(
+        "outgoing", b"\x00" * 4000, 48000, channels=1
+    )
+
+    assert stt.channels == 1
+    assert received == [("outgoing", "this is my microphone")]
+
+
+def test_microphone_is_ducked_during_remote_audio_hold_window():
+    capturer = AudioCapturer.__new__(AudioCapturer)
+    capturer._remote_audio_until = 0.0
+    capturer._mark_remote_audio_active(now=10.0)
+
+    assert capturer._should_duck_microphone(now=10.1)
+    assert not capturer._should_duck_microphone(
+        now=10.0 + Config.MICROPHONE_DUCK_HOLD_SECONDS + 0.01
+    )
+
+
+def test_one_token_microphone_fragment_does_not_pollute_context():
+    stt = _ChannelAwareSTT()
+    stt.transcribe_audio_pcm = lambda *_args, **_kwargs: "the"
+    received = []
+    capturer = _capturer_with(
+        stt,
+        lambda channel, text, raw: received.append((channel, text)),
+    )
+
+    capturer._process_captured_audio(
+        "outgoing", b"\x00" * 4000, 48000, channels=1
+    )
+
+    assert received == []
 
 
 def test_processing_can_pause_for_replay_without_stopping_capture():
@@ -113,7 +170,7 @@ def test_processing_can_pause_for_replay_without_stopping_capture():
 
     capturer.set_processing_enabled(False)
     assert not capturer._processing_enabled.is_set()
-    assert partial_updates == [("incoming", "")]
+    assert partial_updates == [("incoming", ""), ("outgoing", "")]
     assert activity_updates == [(False, 0.0)]
 
     capturer.set_processing_enabled(True)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from html import escape
+import re
 from typing import Callable
 
 from PySide6.QtCore import Qt, QTimer
@@ -22,8 +23,133 @@ from utils.helpers import apply_opacity_to_hex
 from utils.helpers import copy_to_clipboard
 
 
+_REMOTE_SPEAKER_LABEL = re.compile(
+    r"(?<!\w)(?:(?i:REMOTE|TỪ\s+XA)|XA)\s*:"
+)
+
+
+def conversation_display_text(text: str) -> str:
+    """Replace verbose remote-speaker prefixes in conversation-only UI text."""
+    return _REMOTE_SPEAKER_LABEL.sub("🔊", text.strip())
+
+
+class BottomFollowController:
+    """Keep a scroll area on its newest content as layout settles.
+
+    QLabel geometry and the scrollbar range are updated on different event-loop
+    turns. Following ``rangeChanged`` avoids the one-shot race, while the short
+    easing loop prevents visible jumps when several wrapped lines arrive at once.
+    """
+
+    FRAME_INTERVAL_MS = 15
+    FOLLOW_FACTOR = 0.55
+
+    def __init__(self, scroll_area: QScrollArea):
+        self.scroll_area = scroll_area
+        self.scroll_bar = scroll_area.verticalScrollBar()
+        self.enabled = True
+
+        self._layout_timer = QTimer(scroll_area)
+        self._layout_timer.setSingleShot(True)
+        self._layout_timer.timeout.connect(self._begin_follow)
+
+        self._follow_timer = QTimer(scroll_area)
+        self._follow_timer.setInterval(self.FRAME_INTERVAL_MS)
+        self._follow_timer.timeout.connect(self._follow_one_frame)
+        self.scroll_bar.rangeChanged.connect(self._on_range_changed)
+
+    @property
+    def is_animating(self) -> bool:
+        return self._follow_timer.isActive()
+
+    def request(self):
+        """Coalesce renders, then follow any later scrollbar range changes."""
+        if self.enabled and not self._layout_timer.isActive():
+            self._layout_timer.start(0)
+
+    def set_enabled(self, enabled: bool):
+        self.enabled = enabled
+        if not enabled:
+            self._layout_timer.stop()
+            self._follow_timer.stop()
+        else:
+            self.request()
+
+    def _on_range_changed(self, _minimum: int, _maximum: int):
+        if self.enabled and _maximum <= _minimum:
+            self._layout_timer.stop()
+            self._follow_timer.stop()
+            self.scroll_bar.setValue(_minimum)
+            return
+        self.request()
+
+    def _begin_follow(self):
+        if not self.enabled:
+            return
+        self._follow_one_frame()
+        if self.scroll_bar.value() < self.scroll_bar.maximum():
+            self._follow_timer.start()
+
+    def _follow_one_frame(self):
+        if not self.enabled:
+            self._follow_timer.stop()
+            return
+        current = self.scroll_bar.value()
+        target = self.scroll_bar.maximum()
+        remaining = target - current
+        if remaining <= 1:
+            self.scroll_bar.setValue(target)
+            self._follow_timer.stop()
+            return
+        step = max(1, round(remaining * self.FOLLOW_FACTOR))
+        self.scroll_bar.setValue(min(target, current + step))
+
+
+class ContentPulse:
+    """A short, non-blocking highlight for newly completed content."""
+
+    INTERVAL_MS = 150
+    PHASE_COUNT = 5
+
+    def __init__(self, parent: QWidget, render: Callable[[], None]):
+        self.item_id: int | None = None
+        self.visible = False
+        self._phase = 0
+        self._render = render
+        self._timer = QTimer(parent)
+        self._timer.setInterval(self.INTERVAL_MS)
+        self._timer.timeout.connect(self._advance)
+
+    def trigger(self, item_id: int):
+        self.item_id = int(item_id)
+        self.visible = True
+        self._phase = 0
+        self._timer.start()
+
+    def active(self, item_id: int) -> bool:
+        return self.visible and self.item_id == int(item_id)
+
+    def clear(self):
+        self._timer.stop()
+        self.item_id = None
+        self.visible = False
+        self._phase = 0
+
+    def _advance(self):
+        self._phase += 1
+        if self._phase >= self.PHASE_COUNT:
+            self.clear()
+        else:
+            self.visible = not self.visible
+        self._render()
+
+
 class HistoryRegion(QFrame):
     """A bounded history view whose presentation can be pinned independently."""
+
+    MIN_FONT_SCALE = 0.8
+    MAX_FONT_SCALE = 1.8
+    FONT_SCALE_STEP = 0.1
 
     def __init__(
         self,
@@ -50,6 +176,8 @@ class HistoryRegion(QFrame):
         self._visible_snapshot: list[tuple[int, object]] = []
         self._text_opacity = 1.0
         self._window_opacity = 1.0
+        self._base_font_scale = 1.0
+        self._font_adjustment = 0.0
         self._font_scale = 1.0
         self._copyable = copyable
         self.footer_title = footer_title
@@ -57,6 +185,12 @@ class HistoryRegion(QFrame):
         self.max_contextual_history = max_contextual_history
         self._contextual_items: dict[int, object] = {}
         self._visible_contextual_snapshot: list[tuple[int, object]] = []
+        self._main_pulse = ContentPulse(
+            self, lambda: self._render(request_follow=False)
+        )
+        self._contextual_pulse = ContentPulse(
+            self, lambda: self._render_contextual(request_follow=False)
+        )
         self.setObjectName("HistoryRegion")
         self._build_ui()
         self._render()
@@ -95,6 +229,7 @@ class HistoryRegion(QFrame):
         layout.setSpacing(5)
 
         header = QHBoxLayout()
+        self.header_layout = header
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(5)
         self.title_label = QLabel(self.title, self)
@@ -124,6 +259,34 @@ class HistoryRegion(QFrame):
         self.pin_button.setToolTip("Ghim nội dung đang đọc; ứng dụng vẫn tiếp tục xử lý")
         self.pin_button.setAccessibleName(f"Ghim vùng {self.title}")
         self.pin_button.toggled.connect(self.set_pinned)
+
+        self.font_decrease_button = QPushButton("−", self)
+        self.font_decrease_button.setObjectName("FontDecreaseButton")
+        self.font_decrease_button.setFixedSize(24, 22)
+        self.font_decrease_button.setCursor(Qt.PointingHandCursor)
+        self.font_decrease_button.setToolTip(
+            f"Giảm cỡ chữ vùng {self.title}"
+        )
+        self.font_decrease_button.setAccessibleName(
+            f"Giảm cỡ chữ vùng {self.title}"
+        )
+        self.font_decrease_button.clicked.connect(self.decrease_font_size)
+        header.addWidget(self.font_decrease_button)
+
+        self.font_increase_button = QPushButton("+", self)
+        self.font_increase_button.setObjectName("FontIncreaseButton")
+        self.font_increase_button.setFixedSize(24, 22)
+        self.font_increase_button.setCursor(Qt.PointingHandCursor)
+        self.font_increase_button.setToolTip(
+            f"Tăng cỡ chữ vùng {self.title}"
+        )
+        self.font_increase_button.setAccessibleName(
+            f"Tăng cỡ chữ vùng {self.title}"
+        )
+        self.font_increase_button.clicked.connect(self.increase_font_size)
+        header.addWidget(self.font_increase_button)
+        # Pin is the least frequently scanned control, so keep it at the
+        # stable outer-right edge in every region.
         header.addWidget(self.pin_button)
         layout.addLayout(header)
 
@@ -150,6 +313,7 @@ class HistoryRegion(QFrame):
         content_layout.addWidget(self.content_label)
         content_layout.addStretch()
         self.scroll.setWidget(content)
+        self._main_bottom_follow = BottomFollowController(self.scroll)
         layout.addWidget(self.scroll, 1)
 
         if self.footer_title:
@@ -179,11 +343,18 @@ class HistoryRegion(QFrame):
             footer_layout.addWidget(self.footer_label)
             footer_layout.addStretch()
             self.footer_scroll.setWidget(footer_content)
+            self._footer_bottom_follow = BottomFollowController(
+                self.footer_scroll
+            )
             layout.addWidget(self.footer_scroll, 2)
         self._apply_style()
+        self._apply_font_scale()
 
-    def upsert(self, utterance_id: int, item: object):
+    def upsert(
+        self, utterance_id: int, item: object, highlight: bool = True
+    ):
         """Insert/update by ID and retain the newest utterances, not completion order."""
+        changed = self._items.get(utterance_id) != item
         self._items[utterance_id] = item
         retained = sorted(self._items)[-self.max_history :]
         self._items = {key: self._items[key] for key in retained}
@@ -196,10 +367,13 @@ class HistoryRegion(QFrame):
                 self._pending_ids.add(utterance_id)
             self._update_badge()
             return
+        if changed and highlight:
+            self._main_pulse.trigger(utterance_id)
         self._render()
 
     def upsert_contextual(self, utterance_id: int, item: object):
         """Retain a bounded contextual history without moving the fast rows."""
+        changed = self._contextual_items.get(utterance_id) != item
         self._contextual_items[utterance_id] = item
         retained = sorted(self._contextual_items)[-self.max_contextual_history :]
         self._contextual_items = {
@@ -216,6 +390,8 @@ class HistoryRegion(QFrame):
                 self._pending_ids.add(utterance_id)
             self._update_badge()
             return
+        if changed:
+            self._contextual_pulse.trigger(utterance_id)
         self._render_contextual()
 
     def set_pinned(self, pinned: bool):
@@ -226,6 +402,9 @@ class HistoryRegion(QFrame):
             self.pin_button.setChecked(pinned)
             self.pin_button.blockSignals(False)
         self.is_pinned = pinned
+        self._main_bottom_follow.set_enabled(not pinned)
+        if self.footer_title:
+            self._footer_bottom_follow.set_enabled(not pinned)
         if pinned:
             self._visible_snapshot = list(self.ordered_entries)
             self._visible_contextual_snapshot = list(
@@ -253,24 +432,33 @@ class HistoryRegion(QFrame):
         else:
             self.badge.hide()
 
-    def _render(self):
-        items = self.visible_items
-        if not items:
-            self.content_label.setText(
-                f"<span style='color:#94A3B8'>{escape(self.placeholder)}</span>"
-            )
+    def _render(self, request_follow: bool = True):
+        entries = (
+            self._visible_snapshot if self.is_pinned else self.ordered_entries
+        )
+        if not entries:
+            # Preserve one invisible line so the scroll layout does not jump
+            # when the first conversational result arrives.
+            self.content_label.setText("&#8203;")
             return
         # Use one reading order everywhere: oldest at the top, newest at bottom.
-        rendered = [
-            self.formatter(item, index == len(items) - 1)
-            for index, item in enumerate(items)
-        ]
+        rendered = []
+        for index, (utterance_id, item) in enumerate(entries):
+            content = self.formatter(item, index == len(entries) - 1)
+            rendered.append(
+                self._wrap_sentence_pulse(
+                    content,
+                    utterance_id,
+                    self._main_pulse,
+                )
+            )
         self.content_label.setText(
             "<div style='line-height:1.25'>" + "<br><br>".join(rendered) + "</div>"
         )
-        QTimer.singleShot(0, self._scroll_main_to_bottom)
+        if request_follow:
+            self._main_bottom_follow.request()
 
-    def _render_contextual(self):
+    def _render_contextual(self, request_follow: bool = True):
         if not self.footer_title:
             return
         contextual_entries = (
@@ -279,14 +467,12 @@ class HistoryRegion(QFrame):
             else self.ordered_contextual_entries
         )
         if not contextual_entries:
-            self.footer_label.setText(
-                f"<span style='color:#64748B'>{escape(self.footer_placeholder)}</span>"
-            )
+            self.footer_label.setText("&#8203;")
             return
         font_size = max(13, min(19, round(14 * self._font_scale)))
         rendered = []
         newest_english = ""
-        for index, (_, item) in enumerate(contextual_entries):
+        for index, (utterance_id, item) in enumerate(contextual_entries):
             english, vietnamese = item
             is_newest = index == len(contextual_entries) - 1
             if is_newest:
@@ -295,33 +481,34 @@ class HistoryRegion(QFrame):
             vi_color = apply_opacity_to_hex(
                 "#FDE68A", self._text_opacity * alpha
             )
-            rendered.append(
+            content = (
                 f"<span style='color:{vi_color};font-size:{font_size}px;"
                 f"font-weight:{650 if is_newest else 450};line-height:1.35'>"
                 f"{escape(vietnamese)}</span>"
+            )
+            rendered.append(
+                self._wrap_sentence_pulse(
+                    content,
+                    utterance_id,
+                    self._contextual_pulse,
+                )
             )
         self.footer_label.setText(
             "<div>" + "<br><br>".join(rendered) + "</div>"
         )
         self.footer_label.setToolTip(newest_english)
-        QTimer.singleShot(0, self._scroll_footer_to_bottom)
+        if request_follow:
+            self._footer_bottom_follow.request()
 
     def _scroll_main_to_bottom(self):
-        try:
-            scroll_bar = self.scroll.verticalScrollBar()
-            scroll_bar.setValue(scroll_bar.maximum())
-        except RuntimeError:
-            # A queued UI callback may run after a short-lived test/widget closes.
-            pass
+        self._main_bottom_follow.request()
 
     def _scroll_footer_to_bottom(self):
-        try:
-            scroll_bar = self.footer_scroll.verticalScrollBar()
-            scroll_bar.setValue(scroll_bar.maximum())
-        except RuntimeError:
-            pass
+        self._footer_bottom_follow.request()
 
     def clear(self):
+        self._main_pulse.clear()
+        self._contextual_pulse.clear()
         self._items.clear()
         self._contextual_items.clear()
         self._visible_snapshot = []
@@ -350,11 +537,64 @@ class HistoryRegion(QFrame):
         self._apply_style()
 
     def update_font_scale(self, scale: float):
-        self._font_scale = scale
+        self._base_font_scale = scale
+        self._font_scale = self._bounded_font_scale(
+            self._base_font_scale + self._font_adjustment
+        )
+        self._apply_font_scale()
+
+    def decrease_font_size(self):
+        self._adjust_font_size(-self.FONT_SCALE_STEP)
+
+    def increase_font_size(self):
+        self._adjust_font_size(self.FONT_SCALE_STEP)
+
+    def _adjust_font_size(self, delta: float):
+        updated = self._bounded_font_scale(self._font_scale + delta)
+        if updated == self._font_scale:
+            return
+        self._font_scale = updated
+        self._font_adjustment = self._font_scale - self._base_font_scale
+        self._apply_font_scale()
+
+    @classmethod
+    def _bounded_font_scale(cls, scale: float) -> float:
+        return max(cls.MIN_FONT_SCALE, min(cls.MAX_FONT_SCALE, scale))
+
+    def _apply_font_scale(self):
         self.content_label.setStyleSheet(
-            f"font-size: {max(11, min(18, round(12 * scale)))}px;"
+            f"font-size: {max(10, min(22, round(12 * self._font_scale)))}px;"
         )
         self._render_contextual()
+        if self._items:
+            self._main_bottom_follow.request()
+        current_percent = round(self._font_scale * 100)
+        self.font_decrease_button.setEnabled(
+            self._font_scale > self.MIN_FONT_SCALE
+        )
+        self.font_increase_button.setEnabled(
+            self._font_scale < self.MAX_FONT_SCALE
+        )
+        self.font_decrease_button.setToolTip(
+            f"Giảm cỡ chữ vùng {self.title} · hiện tại {current_percent}%"
+        )
+        self.font_increase_button.setToolTip(
+            f"Tăng cỡ chữ vùng {self.title} · hiện tại {current_percent}%"
+        )
+
+    def _wrap_sentence_pulse(
+        self, content: str, utterance_id: int, pulse: ContentPulse
+    ) -> str:
+        active = pulse.active(utterance_id)
+        background = apply_opacity_to_hex(
+            self.accent, 0.20 if active else 0.0
+        )
+        css_class = "new-content-pulse" if active else "content-item"
+        return (
+            f"<span class='{css_class}' "
+            f"style='background-color:{background}'>"
+            f"{content}</span>"
+        )
 
     def _apply_style(self):
         accent = apply_opacity_to_hex(self.accent, self._text_opacity)
@@ -396,12 +636,21 @@ class HistoryRegion(QFrame):
                 color: #FDE68A; background: rgba(245,158,11,0.18);
                 border-color: rgba(245,158,11,0.45);
             }}
+            QPushButton:disabled {{
+                color: #475569; background: rgba(255,255,255,0.02);
+            }}
             """
         )
 
 
 class LiveEnglishRegion(QFrame):
     """Live transcript beside its slower, contextual English reading view."""
+
+    SPEAKER_PRESENTATION = {
+        "YOU": ("BẠN", "#F59E0B"),
+        "REMOTE": ("🔊", "#38BDF8"),
+        "UNKNOWN": ("?", "#94A3B8"),
+    }
 
     def __init__(
         self,
@@ -412,10 +661,19 @@ class LiveEnglishRegion(QFrame):
         super().__init__(parent)
         self.max_history = max_history
         self.max_chars = max_chars
-        self._final_items: dict[int, str] = {}
+        self._final_items: dict[int, tuple[str, str]] = {}
+        self._speaker_by_utterance: dict[int, str] = {}
         self._contextual_item: tuple[int, str] | None = None
         self.partial = ""
+        self.partial_speaker = "REMOTE"
+        self._partials = {"REMOTE": "", "YOU": "", "UNKNOWN": ""}
         self._text_opacity = 1.0
+        self._final_pulse = ContentPulse(
+            self, lambda: self._render(request_follow=False)
+        )
+        self._context_pulse = ContentPulse(
+            self, lambda: self._render_contextual(request_follow=False)
+        )
         self.setObjectName("LiveEnglishRegion")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
@@ -449,6 +707,7 @@ class LiveEnglishRegion(QFrame):
         scroll_layout.addWidget(self.content_label)
         scroll_layout.addStretch()
         self.scroll.setWidget(scroll_content)
+        self._live_bottom_follow = BottomFollowController(self.scroll)
         live_layout.addWidget(self.scroll, 1)
 
         self.column_divider = QFrame(self)
@@ -482,6 +741,9 @@ class LiveEnglishRegion(QFrame):
         context_content_layout.addWidget(self.context_label)
         context_content_layout.addStretch()
         self.context_scroll.setWidget(context_content)
+        self._context_bottom_follow = BottomFollowController(
+            self.context_scroll
+        )
         context_layout.addWidget(self.context_scroll, 1)
 
         self.columns_layout.addWidget(self.live_panel, 1)
@@ -494,13 +756,42 @@ class LiveEnglishRegion(QFrame):
 
     @property
     def history(self) -> list[str]:
-        return [text for _, text in sorted(self._final_items.items())]
+        return [
+            text for _, (_, text) in sorted(self._final_items.items())
+        ]
+
+    def set_speaker(self, utterance_id: int, speaker: str):
+        normalized = self._normalize_speaker(speaker)
+        self._speaker_by_utterance[int(utterance_id)] = normalized
+        existing = self._final_items.get(int(utterance_id))
+        if existing:
+            self._final_items[int(utterance_id)] = (
+                normalized, existing[1]
+            )
+            self._render()
+
+    def update_live_for_speaker(self, speaker: str, text: str):
+        self._set_partial(speaker, text)
 
     def update_live(self, text: str):
-        text = text.strip()
-        if text:
-            self.partial = text
+        self._set_partial("REMOTE", text)
+
+    def _set_partial(self, speaker: str, text: str):
+        normalized_speaker = self._normalize_speaker(speaker)
+        normalized_text = text.strip()
+        if self._partials[normalized_speaker] == normalized_text:
+            return
+        self._partials[normalized_speaker] = normalized_text
+        active = [
+            (key, value) for key, value in self._partials.items() if value
+        ]
+        if normalized_text:
+            self.partial_speaker = normalized_speaker
+            self.partial = normalized_text
+        elif active:
+            self.partial_speaker, self.partial = active[-1]
         else:
+            self.partial_speaker = normalized_speaker
             self.partial = ""
         self._render()
 
@@ -508,17 +799,23 @@ class LiveEnglishRegion(QFrame):
         normalized = text.strip()
         if not normalized:
             return
-        self._final_items[utterance_id] = normalized
+        speaker = self._speaker_by_utterance.get(utterance_id, "REMOTE")
+        changed = self._final_items.get(utterance_id) != (
+            speaker, normalized
+        )
+        self._final_items[utterance_id] = (speaker, normalized)
         retained_ids = sorted(self._final_items)[-self.max_history :]
         self._final_items = {
             key: self._final_items[key] for key in retained_ids
         }
         while (
             len(self._final_items) > 1
-            and sum(len(value) for value in self._final_items.values())
+            and sum(len(value[1]) for value in self._final_items.values())
             > self.max_chars
         ):
             del self._final_items[min(self._final_items)]
+        if changed:
+            self._final_pulse.trigger(utterance_id)
         self._render()
 
     @property
@@ -527,80 +824,98 @@ class LiveEnglishRegion(QFrame):
 
     def update_contextual(self, utterance_id: int, text: str):
         """Replace the contextual view while rejecting stale async results."""
-        normalized = text.strip()
+        normalized = conversation_display_text(text)
         if not normalized:
             return
         if self._contextual_item and utterance_id < self._contextual_item[0]:
             return
+        changed = self._contextual_item != (utterance_id, normalized)
         self._contextual_item = (utterance_id, normalized)
+        if changed:
+            self._context_pulse.trigger(utterance_id)
         self._render_contextual()
 
     def update_partial(self, text: str):
-        if text.strip():
-            self.partial = text.strip()
-            self._render()
+        self._set_partial("REMOTE", text)
 
-    def _render(self):
+    def _render(self, request_follow: bool = True):
         current_color = apply_opacity_to_hex("#E0F2FE", self._text_opacity)
         old_color = apply_opacity_to_hex("#94A3B8", self._text_opacity * 0.72)
         parts = []
         history = self.history
-        for index, text in enumerate(history):
-            is_latest_final = index == len(history) - 1 and not self.partial
+        items = sorted(self._final_items.items())
+        for index, (utterance_id, (speaker, text)) in enumerate(items):
+            is_latest_final = index == len(history) - 1 and not any(
+                self._partials.values()
+            )
             color = current_color if is_latest_final else old_color
             weight = 650 if is_latest_final else 450
-            parts.append(
-                f"<span style='color:{color};font-weight:{weight}'>"
+            content = (
+                self._speaker_badge(speaker)
+                + "&nbsp;"
+                + f"<span style='color:{color};font-weight:{weight}'>"
                 f"{escape(text)}</span>"
             )
-        if self.partial:
             parts.append(
-                f"<span style='color:{current_color};font-weight:650'>"
-                f"🎙 {escape(self.partial)} …</span>"
+                self._wrap_sentence_pulse(
+                    content,
+                    utterance_id,
+                    self._final_pulse,
+                    "#38BDF8",
+                )
             )
-        elif not history:
-            parts.append(f"<span style='color:{old_color}'>Đang chờ giọng nói…</span>")
+        for speaker, partial in self._partials.items():
+            if not partial:
+                continue
+            parts.append(
+                self._speaker_badge(speaker)
+                + "&nbsp;"
+                + f"<span style='color:{current_color};font-weight:650'>"
+                f"{escape(partial)} …</span>"
+            )
+        if not any(self._partials.values()) and not history:
+            parts.append("&#8203;")
         self.content_label.setText("<br><br>".join(parts))
         # LIVE has a stable focus anchor at the bottom. Speech must remain visible
         # even if the user briefly inspected older text; other regions provide pin.
-        QTimer.singleShot(0, self._scroll_to_bottom)
+        if request_follow:
+            self._live_bottom_follow.request()
 
     def _scroll_to_bottom(self):
-        try:
-            scroll_bar = self.scroll.verticalScrollBar()
-            scroll_bar.setValue(scroll_bar.maximum())
-        except RuntimeError:
-            # A queued UI callback may run after a short-lived test/widget closes.
-            pass
+        self._live_bottom_follow.request()
 
-    def _render_contextual(self):
+    def _render_contextual(self, request_follow: bool = True):
         current_color = apply_opacity_to_hex("#BAE6FD", self._text_opacity)
         if not self._contextual_item:
-            placeholder_color = apply_opacity_to_hex(
-                "#94A3B8", self._text_opacity * 0.72
-            )
-            self.context_label.setText(
-                f"<span style='color:{placeholder_color}'>"
-                "Đang tích lũy ngữ cảnh…</span>"
-            )
+            self.context_label.setText("&#8203;")
             return
-        self.context_label.setText(
+        content = (
             f"<span style='color:{current_color};font-weight:550;line-height:1.3'>"
             f"{escape(self._contextual_item[1])}</span>"
         )
-        QTimer.singleShot(0, self._scroll_context_to_bottom)
+        self.context_label.setText(
+            self._wrap_sentence_pulse(
+                content,
+                self._contextual_item[0],
+                self._context_pulse,
+                "#7DD3FC",
+            )
+        )
+        if request_follow:
+            self._context_bottom_follow.request()
 
     def _scroll_context_to_bottom(self):
-        try:
-            scroll_bar = self.context_scroll.verticalScrollBar()
-            scroll_bar.setValue(scroll_bar.maximum())
-        except RuntimeError:
-            pass
+        self._context_bottom_follow.request()
 
     def clear(self):
+        self._final_pulse.clear()
+        self._context_pulse.clear()
         self._final_items.clear()
+        self._speaker_by_utterance.clear()
         self._contextual_item = None
         self.partial = ""
+        self.partial_speaker = "REMOTE"
+        self._partials = {"REMOTE": "", "YOU": "", "UNKNOWN": ""}
         self._render()
         self._render_contextual()
 
@@ -622,15 +937,50 @@ class LiveEnglishRegion(QFrame):
         )
 
     def update_font_scale(self, scale: float):
-        self.content_label.setStyleSheet(
-            f"font-size: {max(12, min(20, round(13 * scale)))}px;"
-        )
-        self.context_label.setStyleSheet(
-            f"font-size: {max(12, min(20, round(13 * scale)))}px;"
-        )
+        self._font_scale = scale
+        font_size = max(12, min(20, round(13 * scale)))
+        self.content_label.setStyleSheet(f"font-size:{font_size}px;")
+        self.context_label.setStyleSheet(f"font-size:{font_size}px;")
 
     def _apply_style(self):
         self.update_window_opacity(1.0)
+
+    @staticmethod
+    def _wrap_sentence_pulse(
+        content: str,
+        utterance_id: int,
+        pulse: ContentPulse,
+        accent: str,
+    ) -> str:
+        active = pulse.active(utterance_id)
+        background = apply_opacity_to_hex(
+            accent, 0.18 if active else 0.0
+        )
+        css_class = "new-content-pulse" if active else "content-item"
+        return (
+            f"<span class='{css_class}' "
+            f"style='background-color:{background}'>"
+            f"{content}</span>"
+        )
+
+    @classmethod
+    def _normalize_speaker(cls, speaker: str) -> str:
+        normalized = (speaker or "UNKNOWN").strip().upper()
+        return normalized if normalized in cls.SPEAKER_PRESENTATION else "UNKNOWN"
+
+    @classmethod
+    def _speaker_badge(cls, speaker: str) -> str:
+        normalized = cls._normalize_speaker(speaker)
+        label, color = cls.SPEAKER_PRESENTATION[normalized]
+        if normalized == "REMOTE":
+            return (
+                f"<span title='Giọng phía bên kia' "
+                f"style='color:{color};font-size:12px'>🔊</span>"
+            )
+        return (
+            f"<span style='color:{color};font-size:9px;font-weight:750'>"
+            f"[{escape(label)}]</span>"
+        )
 
 
 class GlanceableDashboard(QWidget):
@@ -641,27 +991,27 @@ class GlanceableDashboard(QWidget):
         self._text_opacity = 1.0
         self.live_region = LiveEnglishRegion(self)
         self.translation_region = HistoryRegion(
-            "DỊCH TIẾNG VIỆT", "#F6AD55", "Đang chờ bản dịch…",
+            "DỊCH TIẾNG VIỆT", "#F6AD55", "",
             self._format_translation, self, max_history=2,
         )
         self.contextual_translation_region = HistoryRegion(
             "DỊCH THEO NGỮ CẢNH · HỘI THOẠI GẦN ĐÂY",
             "#FDE68A",
-            "Đang tích lũy ngữ cảnh hội thoại…",
+            "",
             self._format_contextual_translation,
             self,
             max_history=8,
         )
         self.reply_region = HistoryRegion(
-            "RECOMMENDED REPLY", "#68D391", "Đang chờ gợi ý trả lời…",
+            "RECOMMENDED REPLY", "#68D391", "",
             self._format_reply, self, copyable=True,
         )
         self.keywords_region = HistoryRegion(
-            "KEYWORDS", "#6EE7B7", "Đang chờ từ khóa…",
+            "KEYWORDS", "#6EE7B7", "",
             self._format_keywords, self,
         )
         self.context_region = HistoryRegion(
-            "NGỮ CẢNH / Ý ĐỊNH", "#E9D8A6", "Đang phân tích ngữ cảnh…",
+            "NGỮ CẢNH / Ý ĐỊNH", "#E9D8A6", "",
             self._format_context, self,
         )
 
@@ -674,7 +1024,7 @@ class GlanceableDashboard(QWidget):
         translation_context_layout.setContentsMargins(0, 0, 0, 0)
         translation_context_layout.setSpacing(8)
         translation_context_layout.addWidget(self.translation_region, 1)
-        translation_context_layout.addWidget(self.context_region, 2)
+        translation_context_layout.addWidget(self.context_region, 1)
         self.translation_context_layout = translation_context_layout
 
         layout = QGridLayout(self)
@@ -705,6 +1055,12 @@ class GlanceableDashboard(QWidget):
     def update_stream1c(self, text: str):
         self.live_region.update_live(text)
 
+    def update_speaker(self, utterance_id: int, speaker: str):
+        self.live_region.set_speaker(utterance_id, speaker)
+
+    def update_speaker_partial(self, speaker: str, text: str):
+        self.live_region.update_live_for_speaker(speaker, text)
+
     def update_partial_speech(self, text: str):
         self.live_region.update_partial(text)
 
@@ -712,8 +1068,14 @@ class GlanceableDashboard(QWidget):
         self, utterance_id: int, english_text: str, vietnamese_trans: str
     ):
         self.live_region.update_final(utterance_id, english_text)
-        item = (english_text.strip(), vietnamese_trans.strip())
-        self.translation_region.upsert(utterance_id, item)
+        normalized_translation = vietnamese_trans.strip()
+        if not normalized_translation or normalized_translation.casefold() == "đang dịch...":
+            return
+        item = (english_text.strip(), normalized_translation)
+        self.translation_region.upsert(
+            utterance_id,
+            item,
+        )
 
     def update_stream1b(self, utterance_id: int, explanation_text: str):
         if explanation_text.strip():
@@ -731,7 +1093,10 @@ class GlanceableDashboard(QWidget):
         if vietnamese_trans.strip():
             self.contextual_translation_region.upsert(
                 utterance_id,
-                (combined_english.strip(), vietnamese_trans.strip()),
+                (
+                    conversation_display_text(combined_english),
+                    conversation_display_text(vietnamese_trans),
+                ),
             )
 
     def update_stream2a(self, utterance_id: int, keywords_text: str):
@@ -805,7 +1170,7 @@ class GlanceableDashboard(QWidget):
         alpha = 1.0 if newest else 0.58
         vi_color = apply_opacity_to_hex("#FDE68A", self._text_opacity * alpha)
         return (
-            f"<span style='color:{vi_color};font-size:14px;"
+            f"<span style='color:{vi_color};"
             f"font-weight:{650 if newest else 450};line-height:1.35'>"
             f"{escape(vietnamese)}</span>"
         )

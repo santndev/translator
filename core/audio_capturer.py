@@ -32,10 +32,15 @@ class AudioCapturer:
         self._threads = []
         self.pyaudio_instance = None
         self._active_stream = None
+        self._microphone_pyaudio = None
+        self._microphone_stream = None
+        self._loopback_ready = threading.Event()
+        self._remote_audio_until = 0.0
         
         # Initialize Vosk Model for Zero-Latency Stream 1c
         vosk.SetLogLevel(-1) # Disable verbose logs
-        model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'models', 'vosk-model-small-en-us-0.15'))
+        from config import Config
+        model_path = Config.VOSK_MODEL_PATH
         try:
             if os.path.exists(model_path):
                 self.vosk_model = vosk.Model(model_path)
@@ -69,6 +74,220 @@ class AudioCapturer:
         t_loopback.start()
         self._threads.append(t_loopback)
 
+        if Config.CAPTURE_MICROPHONE:
+            t_microphone = threading.Thread(
+                target=self._capture_microphone,
+                name="microphone-capture",
+                daemon=True,
+            )
+            t_microphone.start()
+            self._threads.append(t_microphone)
+        else:
+            logger.info(
+                "Microphone capture disabled by "
+                "TRANSLATOR_CAPTURE_MICROPHONE."
+            )
+
+    def _capture_microphone(self):
+        """Capture the local user's microphone without taking down loopback."""
+        restart_count = 0
+        while self.is_running:
+            try:
+                self._run_microphone_session()
+                return
+            except Exception as error:
+                restart_count += 1
+                logger.warning(
+                    "Microphone capture unavailable "
+                    f"(attempt {restart_count}): {error}"
+                )
+            finally:
+                stream = self._microphone_stream
+                self._microphone_stream = None
+                if stream is not None:
+                    try:
+                        stream.stop_stream()
+                    except Exception:
+                        pass
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                # The microphone deliberately shares the loopback PyAudio host.
+                # Its owner is responsible for terminating that host.
+                self._microphone_pyaudio = None
+            if self.is_running:
+                time.sleep(min(5.0, 0.5 * restart_count))
+
+    def _run_microphone_session(self):
+        """Run one local microphone VAD/STT session."""
+        try:
+            import pyaudiowpatch as pyaudio
+
+            if not self._loopback_ready.wait(timeout=8.0):
+                raise RuntimeError("WASAPI host did not become ready")
+            p = self.pyaudio_instance
+            if p is None:
+                raise RuntimeError("WASAPI host was reset")
+            self._microphone_pyaudio = p
+            device = p.get_default_input_device_info()
+            if int(device.get("maxInputChannels", 0)) < 1:
+                raise RuntimeError("default input device has no input channel")
+
+            sample_rate = int(device["defaultSampleRate"])
+            channels = 1
+            stream = p.open(
+                format=pyaudio.paInt16,
+                channels=channels,
+                rate=sample_rate,
+                input=True,
+                input_device_index=device["index"],
+                frames_per_buffer=1024,
+            )
+            self._microphone_stream = stream
+            logger.info(
+                "Microphone Audio Listener ACTIVE: "
+                f"'{device['name']}' ({sample_rate}Hz)"
+            )
+
+            audio_buffer = bytearray()
+            silence_counter = 0
+            speaking = False
+            latest_vosk_text = ""
+            vosk_final_parts = []
+            noise_floor = 40.0
+            threshold = 112.0
+            silence_limit, max_bytes, min_bytes = self._calculate_vad_limits(
+                sample_rate, channels
+            )
+            recognizer = (
+                vosk.KaldiRecognizer(self.vosk_model, 16000)
+                if getattr(self, "vosk_model", None)
+                else None
+            )
+            read_errors = 0
+            remote_ducking = False
+
+            while self.is_running:
+                try:
+                    if stream.get_read_available() < 1024:
+                        time.sleep(0.005)
+                        continue
+                    data = stream.read(1024, exception_on_overflow=False)
+                    read_errors = 0
+                    if not data:
+                        continue
+
+                    if not self._processing_enabled.is_set():
+                        audio_buffer.clear()
+                        silence_counter = 0
+                        speaking = False
+                        latest_vosk_text = ""
+                        vosk_final_parts = []
+                        if recognizer:
+                            recognizer.Reset()
+                        time.sleep(0.005)
+                        continue
+
+                    if self._should_duck_microphone():
+                        audio_buffer.clear()
+                        silence_counter = 0
+                        speaking = False
+                        latest_vosk_text = ""
+                        vosk_final_parts = []
+                        if not remote_ducking:
+                            if recognizer:
+                                recognizer.Reset()
+                            if self.callback_partial_speech:
+                                self.callback_partial_speech("outgoing", "")
+                        remote_ducking = True
+                        continue
+                    remote_ducking = False
+
+                    audio_np = np.frombuffer(data, dtype=np.int16)
+                    energy = (
+                        float(np.abs(audio_np).mean())
+                        if len(audio_np) > 0
+                        else 0.0
+                    )
+                    if not speaking:
+                        noise_floor = 0.98 * noise_floor + 0.02 * min(
+                            energy, 1000.0
+                        )
+                    threshold = min(
+                        700.0,
+                        max(
+                            Config.MICROPHONE_VAD_THRESHOLD_MIN,
+                            noise_floor * 3.2,
+                        ),
+                    )
+
+                    if recognizer and self.callback_partial_speech:
+                        audio_16k = self._pcm_to_16k_mono(
+                            audio_np, sample_rate, channels
+                        )
+                        if recognizer.AcceptWaveform(audio_16k):
+                            result = json.loads(recognizer.Result())
+                            final_text = result.get("text", "").strip()
+                            if final_text and (
+                                not vosk_final_parts
+                                or vosk_final_parts[-1] != final_text
+                            ):
+                                vosk_final_parts.append(final_text)
+                            latest_vosk_text = " ".join(vosk_final_parts)
+                        else:
+                            partial = json.loads(
+                                recognizer.PartialResult()
+                            ).get("partial", "").strip()
+                            latest_vosk_text = " ".join(
+                                [*vosk_final_parts, partial]
+                            ).strip()
+                        if latest_vosk_text:
+                            self.callback_partial_speech(
+                                "outgoing", latest_vosk_text
+                            )
+
+                    if energy > threshold:
+                        audio_buffer.extend(data)
+                        speaking = True
+                        silence_counter = 0
+                    elif speaking:
+                        audio_buffer.extend(data)
+                        silence_counter += 1
+
+                    if speaking and (
+                        silence_counter >= silence_limit
+                        or len(audio_buffer) >= max_bytes
+                    ):
+                        pcm_bytes = bytes(audio_buffer)
+                        fallback_text = latest_vosk_text
+                        audio_buffer.clear()
+                        silence_counter = 0
+                        speaking = False
+                        latest_vosk_text = ""
+                        vosk_final_parts = []
+                        if self.callback_partial_speech:
+                            self.callback_partial_speech("outgoing", "")
+                        if recognizer:
+                            recognizer.Reset()
+                        if len(pcm_bytes) >= min_bytes:
+                            self._process_captured_audio(
+                                "outgoing",
+                                pcm_bytes,
+                                sample_rate,
+                                channels=channels,
+                                fallback_text=fallback_text,
+                            )
+                except Exception as error:
+                    read_errors += 1
+                    if read_errors >= 20:
+                        raise RuntimeError(
+                            "microphone stream failed repeatedly"
+                        ) from error
+                    time.sleep(0.01)
+        except Exception as error:
+            raise RuntimeError(f"microphone session failed: {error}") from error
+
     def _capture_wasapi_loopback(self):
         """Keep the loopback session alive across stalled streams/device resets."""
         restart_count = 0
@@ -85,6 +304,7 @@ class AudioCapturer:
                 if self.callback_audio_activity:
                     self.callback_audio_activity(False, 0.0)
             finally:
+                self._loopback_ready.clear()
                 stream = self._active_stream
                 self._active_stream = None
                 if stream is not None:
@@ -143,6 +363,7 @@ class AudioCapturer:
                 frames_per_buffer=1024
             )
             self._active_stream = stream
+            self._loopback_ready.set()
 
             audio_buffer = bytearray()
             silence_counter = 0
@@ -217,13 +438,9 @@ class AudioCapturer:
                     is_phrase_boundary = False
                     if vosk_recognizer and self.callback_partial_speech:
                         # Convert to 16kHz mono
-                        if channels > 1:
-                            audio_mono = audio_np.reshape(-1, channels).mean(axis=1).astype(np.int16)
-                        else:
-                            audio_mono = audio_np
-                        
-                        step = max(1, int(round(sample_rate / 16000.0)))
-                        audio_16k_bytes = audio_mono[::step].tobytes()
+                        audio_16k_bytes = self._pcm_to_16k_mono(
+                            audio_np, sample_rate, channels
+                        )
                         
                         is_phrase_boundary = vosk_recognizer.AcceptWaveform(audio_16k_bytes)
                         if is_phrase_boundary:
@@ -248,6 +465,7 @@ class AudioCapturer:
                                 )
 
                     if energy > threshold:
+                        self._mark_remote_audio_active()
                         audio_buffer.extend(data)
                         speaking = True
                         silence_counter = 0
@@ -296,6 +514,7 @@ class AudioCapturer:
                                 "incoming",
                                 pcm_bytes,
                                 sample_rate,
+                                channels=channels,
                                 fallback_text=vosk_fallback_text,
                             )
 
@@ -331,6 +550,7 @@ class AudioCapturer:
         channel_type: str,
         pcm_bytes: bytes,
         sample_rate: int,
+        channels: int = 1,
         fallback_text: str = "",
     ):
         """Transcribes PCM audio bytes and triggers speech callback."""
@@ -342,7 +562,11 @@ class AudioCapturer:
             and getattr(self.stt_engine, "is_ready", False)
         )
         if stt_ready:
-            text = self.stt_engine.transcribe_audio_pcm(pcm_bytes, sample_rate=sample_rate)
+            text = self.stt_engine.transcribe_audio_pcm(
+                pcm_bytes,
+                sample_rate=sample_rate,
+                channels=channels,
+            )
 
         text = self._normalize_transcript(text)
         normalized_fallback = self._normalize_transcript(fallback_text)
@@ -353,6 +577,12 @@ class AudioCapturer:
             logger.info(f"{reason}; using Vosk final transcript: '{text}'")
 
         if text and text.strip():
+            if channel_type == "outgoing" and len(text.split()) < 2:
+                logger.info(
+                    "Ignored one-token microphone fragment; insufficient "
+                    f"context value and high echo risk: '{text}'"
+                )
+                return
             logger.info(f"Transcribed '{channel_type}' speech: '{text.strip()}'")
             if self.callback:
                 self.callback(channel_type, text.strip(), pcm_bytes)
@@ -386,9 +616,38 @@ class AudioCapturer:
         bytes_per_second = sample_rate * channels * 2
         return (
             silence_chunks,
-            bytes_per_second * 8,
+            int(bytes_per_second * Config.MAX_UTTERANCE_SECONDS),
             int(bytes_per_second * 0.45),
         )
+
+    @staticmethod
+    def _pcm_to_16k_mono(
+        audio: np.ndarray, sample_rate: int, channels: int
+    ) -> bytes:
+        """Create Vosk-compatible 16 kHz mono int16 PCM."""
+        source_channels = max(1, int(channels))
+        usable = len(audio) // source_channels * source_channels
+        if source_channels > 1 and usable:
+            mono = audio[:usable].reshape(-1, source_channels).mean(
+                axis=1
+            ).astype(np.int16)
+        else:
+            mono = audio.astype(np.int16, copy=False)
+        step = max(1, int(round(sample_rate / 16000.0)))
+        return mono[::step].tobytes()
+
+    def _mark_remote_audio_active(self, now: float | None = None) -> None:
+        timestamp = time.monotonic() if now is None else now
+        self._remote_audio_until = max(
+            self._remote_audio_until,
+            timestamp + Config.MICROPHONE_DUCK_HOLD_SECONDS,
+        )
+
+    def _should_duck_microphone(self, now: float | None = None) -> bool:
+        if not Config.MICROPHONE_DUCK_WHEN_REMOTE:
+            return False
+        timestamp = time.monotonic() if now is None else now
+        return timestamp < self._remote_audio_until
 
     def inject_mock_audio(self, channel_type: str, text_payload: str, raw_pcm_bytes: bytes = None):
         """Injects mock audio/text payload into the capture pipeline for automated testing."""
@@ -406,16 +665,17 @@ class AudioCapturer:
             self._processing_enabled.clear()
             if self.callback_partial_speech:
                 self.callback_partial_speech("incoming", "")
+                self.callback_partial_speech("outgoing", "")
             if self.callback_audio_activity:
                 self.callback_audio_activity(False, 0.0)
         logger.info(f"Audio speech processing {'enabled' if enabled else 'paused'}.")
 
     def stop_capture(self):
         self.is_running = False
-        stream = self._active_stream
-        if stream is not None:
-            try:
-                stream.stop_stream()
-            except Exception:
-                pass
+        for stream in (self._active_stream, self._microphone_stream):
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                except Exception:
+                    pass
         logger.info("Audio Capture Engine stopped.")

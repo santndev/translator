@@ -5,14 +5,22 @@ Supports Cloud LLM APIs (Gemini, Groq, OpenAI) with fast local NLP dynamic fallb
 """
 import re
 import time
-import urllib.request
-import json
-from config import Config
+from core.gemini_client import GeminiClient
 from utils.logger import logger
 
 class DynamicAIGenerator:
-    def __init__(self):
-        pass
+    REQUIRED_STREAM_KEYS = (
+        "stream_1b",
+        "stream_2a",
+        "stream_2b_quick_en",
+        "stream_2b_quick_vi",
+        "stream_2b_en",
+        "stream_2b_vi",
+        "stream_2b_should_reply",
+    )
+
+    def __init__(self, gemini_client=None):
+        self.gemini = gemini_client or GeminiClient()
 
     def generate_all_streams(self, english_text: str) -> dict:
         """
@@ -34,7 +42,7 @@ class DynamicAIGenerator:
             }
 
         # Try Gemini / Cloud LLM API if key is present
-        if Config.GEMINI_API_KEY:
+        if self.gemini.is_configured:
             try:
                 return self._generate_via_gemini(english_text)
             except Exception as e:
@@ -44,28 +52,121 @@ class DynamicAIGenerator:
         return self._generate_dynamic_nlp(english_text)
 
     def _generate_via_gemini(self, english_text: str) -> dict:
-        """Calls Gemini API for ultra-fast dynamic LLM generation."""
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={Config.GEMINI_API_KEY}"
+        """Use Gemini for content-aware analysis and reply generation."""
         prompt = (
-            f"Analyze this technical interview/call statement: '{english_text}'\n"
-            "Return JSON with 7 keys:\n"
-            "1. 'stream_1b': 1-line Vietnamese explanation of what the speaker is asking/meaning.\n"
-            "2. 'stream_2a': 4 to 6 core technical keywords separated by semicolons.\n"
-            "3. 'stream_2b_quick_en': A safe, natural English reply of at most 10 words that buys time or acknowledges the speaker.\n"
-            "4. 'stream_2b_quick_vi': Vietnamese translation of the quick reply.\n"
-            "5. 'stream_2b_en': A polished professional answer of at most 2 short sentences. Do not invent facts; ask for clarification when context is insufficient.\n"
-            "6. 'stream_2b_vi': Vietnamese translation of the full answer.\n"
-            "7. 'stream_2b_should_reply': boolean. False for fillers, closings, acknowledgements, or informational updates that do not require a response. When false, return empty quick/full English replies.\n"
-            "Return valid raw JSON only without markdown formatting."
+            "You assist a Vietnamese human during a live English conversation. "
+            "Write replies that the human can say to the other speaker; never "
+            "answer as an AI assistant or discuss your own capabilities. "
+            "The text before 'Previous context:' is the LATEST utterance and is "
+            "always primary. Earlier context only helps resolve references; never "
+            "answer an older question instead of the latest utterance.\n\n"
+            f"INPUT:\n{english_text}\n\n"
+            "Return one JSON object with exactly these fields:\n"
+            "- stream_1b: concise Vietnamese explanation of the latest meaning, "
+            "intent, and relevant context.\n"
+            "- stream_2a: 4-6 keywords from the latest utterance, separated by semicolons.\n"
+            "- stream_2b_should_reply: true only when the listener should respond: "
+            "a direct question, request, decision, or action directed at them. Use "
+            "false for narration, fillers, acknowledgements, rhetorical or "
+            "self-answered questions, informational updates, and statements that "
+            "merely say what someone could/might do. Do not infer a request from "
+            "a modal verb alone.\n"
+            "- stream_2b_quick_en: when a reply is needed, a useful natural reply "
+            "of at most 10 words; otherwise empty.\n"
+            "- stream_2b_quick_vi: faithful Vietnamese translation of quick_en; "
+            "otherwise empty.\n"
+            "- stream_2b_en: when needed, a direct professional answer of at most "
+            "2 short sentences. Answer the exact question, never use generic "
+            "boilerplate or invent facts; request clarification only when truly needed.\n"
+            "- stream_2b_vi: faithful Vietnamese translation of stream_2b_en; "
+            "otherwise empty."
         )
-        req_data = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode('utf-8')
-        req = urllib.request.Request(url, data=req_data, headers={'Content-Type': 'application/json'}, method='POST')
-        
-        with urllib.request.urlopen(req, timeout=4) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-            raw_text = data['candidates'][0]['content']['parts'][0]['text']
-            cleaned_json = raw_text.replace("```json", "").replace("```", "").strip()
-            return json.loads(cleaned_json)
+        started = time.perf_counter()
+        result = self.gemini.generate_json(
+            prompt, max_output_tokens=650, thinking_level="minimal"
+        )
+        normalized = self._normalize_gemini_result(result)
+        if (
+            normalized["stream_2b_should_reply"]
+            and not self._latest_explicitly_requires_response(english_text)
+        ):
+            logger.info(
+                "Suppressed speculative recommended reply for an "
+                "informational latest turn."
+            )
+            normalized.update(
+                {
+                    "stream_2b_should_reply": False,
+                    "stream_2b_quick_en": "",
+                    "stream_2b_quick_vi": (
+                        "Không cần phản hồi ngay — tiếp tục lắng nghe."
+                    ),
+                    "stream_2b_en": "",
+                    "stream_2b_vi": "",
+                }
+            )
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.info(
+            f"Gemini {self.gemini.model} generated conversation streams "
+            f"in {elapsed_ms:.0f} ms"
+        )
+        return normalized
+
+    @staticmethod
+    def _latest_explicitly_requires_response(english_text: str) -> bool:
+        """Conservatively require a direct response cue in the latest turn."""
+        latest = english_text.split("\nPrevious context:", 1)[0].strip()
+        lowered = latest.lower()
+        if "?" in latest:
+            return True
+        if re.search(
+            r"\b(please|let me know|can you|could you|would you|will you|"
+            r"do you agree|what do you think|are you okay with|"
+            r"i need you|we need you|your approval|your input|"
+            r"your decision|your feedback)\b",
+            lowered,
+        ):
+            return True
+        return bool(
+            re.match(
+                r"^\s*(review|check|send|share|update|confirm|prepare|"
+                r"schedule|fix|investigate|provide|create|choose|decide)\b",
+                lowered,
+            )
+        )
+
+    @classmethod
+    def _normalize_gemini_result(cls, result: dict) -> dict:
+        missing = [key for key in cls.REQUIRED_STREAM_KEYS if key not in result]
+        if missing:
+            raise ValueError(f"Gemini response missing fields: {', '.join(missing)}")
+
+        normalized = {
+            key: str(result.get(key, "")).strip()
+            for key in cls.REQUIRED_STREAM_KEYS
+            if key != "stream_2b_should_reply"
+        }
+        raw_should_reply = result["stream_2b_should_reply"]
+        if isinstance(raw_should_reply, bool):
+            should_reply = raw_should_reply
+        elif isinstance(raw_should_reply, str) and raw_should_reply.lower() in {
+            "true",
+            "false",
+        }:
+            should_reply = raw_should_reply.lower() == "true"
+        else:
+            raise ValueError("Gemini should_reply field is not a boolean")
+        normalized["stream_2b_should_reply"] = should_reply
+        if not should_reply:
+            normalized.update(
+                {
+                    "stream_2b_quick_en": "",
+                    "stream_2b_quick_vi": "Không cần phản hồi ngay — tiếp tục lắng nghe.",
+                    "stream_2b_en": "",
+                    "stream_2b_vi": "",
+                }
+            )
+        return normalized
 
     def _generate_dynamic_nlp(self, english_text: str) -> dict:
         """

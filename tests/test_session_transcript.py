@@ -33,3 +33,13 @@ def test_transcript_retention_is_bounded():
     assert "English: first" not in content
     assert "English: second" in content
     assert "English: third" in content
+
+
+def test_transcript_exports_speaker_source():
+    transcript = SessionTranscript()
+    transcript.record_english(1, "Can you hear me?", speaker="YOU")
+    transcript.record_english(2, "Yes, clearly.", speaker="REMOTE")
+
+    content = transcript.render_text()
+    assert "Speaker: YOU\nEnglish: Can you hear me?" in content
+    assert "Speaker: REMOTE\nEnglish: Yes, clearly." in content

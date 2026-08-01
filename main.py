@@ -16,6 +16,7 @@ if sys.platform == "win32" and os.getenv("QT_QPA_PLATFORM") == "offscreen":
 from config import Config
 from core.audio_capturer import AudioCapturer
 from core.conversation_context import ConversationContext
+from core.gemini_client import GeminiClient
 from core.latest_task_pool import LatestTaskPool
 from core.session_recorder import SessionRecorder
 from core.session_replay import ReplayEvent, SessionReplayTimeline
@@ -100,8 +101,14 @@ class AppController:
 
         # Initialize Core Engines
         self.stt_engine = STTEngine(model_size="tiny.en")
-        self.translator = TranslatorEngine()
-        self.smart_reply = SmartReplyEngine()
+        # One shared Gemini client means translation and assistance share the
+        # same rate-limit circuit instead of independently hammering the API.
+        self.gemini_client = GeminiClient()
+        self.gemini_client.add_status_listener(
+            self.overlay.signal_ai_status.emit
+        )
+        self.translator = TranslatorEngine(gemini_client=self.gemini_client)
+        self.smart_reply = SmartReplyEngine(gemini_client=self.gemini_client)
         self.audio_capturer = AudioCapturer(
             callback_on_speech=self.on_audio_received,
             stt_engine=self.stt_engine,
@@ -149,8 +156,10 @@ class AppController:
 
     def on_partial_audio_received(self, channel_type: str, partial_text: str):
         """Luồng 1c: Independent live word-by-word streaming display."""
-        if channel_type == "incoming":
-            self._emit_stream("signal_stream1c", partial_text.strip())
+        speaker = self._speaker_for_channel(channel_type)
+        self._emit_stream(
+            "signal_speaker_partial", speaker, partial_text.strip()
+        )
 
     def _emit_stream(self, signal_name: str, *payload):
         """Emit a UI stream and retain it when a recording timeline is active."""
@@ -166,14 +175,32 @@ class AppController:
 
 
 
-    def process_incoming_speech(self, english_text: str):
+    @staticmethod
+    def _speaker_for_channel(channel_type: str) -> str:
+        if channel_type == "outgoing":
+            return "YOU"
+        if channel_type == "incoming":
+            return "REMOTE"
+        return "UNKNOWN"
+
+    def process_speech(self, english_text: str, channel_type: str):
         """
-        Processes incoming English through bounded latest-result worker streams.
+        Process one speaker turn through bounded latest-result worker streams.
+
+        Local speech contributes to translation and conversation context, but
+        never triggers a reply suggestion to the user's own words.
         """
-        logger.info(f"Processing Incoming English Speech: '{english_text}'")
+        speaker = self._speaker_for_channel(channel_type)
+        logger.info(f"Processing {speaker} English Speech: '{english_text}'")
         utterance_id = next(self._utterance_ids)
-        self._session_transcript.record_english(utterance_id, english_text)
-        translation_context = self._conversation_context.add(english_text)
+        self._session_transcript.record_english(
+            utterance_id, english_text, speaker=speaker
+        )
+        self._emit_stream("signal_speaker", utterance_id, speaker)
+        context_label = "BẠN" if speaker == "YOU" else speaker
+        translation_context = self._conversation_context.add(
+            f"{context_label}: {english_text}"
+        )
         previous_context = translation_context[:-1]
         analysis_context = english_text
         if previous_context:
@@ -182,7 +209,7 @@ class AppController:
         # --- LUỒNG 1A: Dịch Realtime (Live Subtitle - Instant 0ms English Display) ---
         # 1. Emit English transcript IMMEDIATELY (0ms delay)
         self._emit_stream(
-            "signal_stream1a", utterance_id, english_text, "Đang dịch..."
+            "signal_stream1a", utterance_id, english_text, ""
         )
         # Keep the contextual English view local and immediate. It must not wait
         # for the slower contextual Vietnamese translation/network path.
@@ -233,6 +260,12 @@ class AppController:
                 publish_contextual_translation,
             )
 
+        if speaker != "REMOTE":
+            # A local turn makes an in-flight reply for the previous remote
+            # turn obsolete, but it should not consume a worker just to cancel.
+            self._task_pool.invalidate("assistance", utterance_id)
+            return
+
         def prepare_assistance() -> dict:
             bundle = self.smart_reply.generate_stream_bundle(analysis_context)
             fast_bilingual = self.translator.format_bilingual_keywords(
@@ -270,10 +303,14 @@ class AppController:
             publish_assistance,
         )
 
+    def process_incoming_speech(self, english_text: str):
+        """Backward-compatible entry point used by existing tests/tools."""
+        self.process_speech(english_text, "incoming")
+
     def on_audio_received(self, channel_type: str, text_payload: str, raw_bytes: bytes = None):
         """Callback triggered when audio/speech is captured or injected."""
-        if channel_type == "incoming":
-            self.process_incoming_speech(text_payload)
+        if channel_type in {"incoming", "outgoing"}:
+            self.process_speech(text_payload, channel_type)
 
     def _handle_recording_toggled(self, enabled: bool):
         try:

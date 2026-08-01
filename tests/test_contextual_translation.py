@@ -4,7 +4,7 @@ from config import Config
 from core.translator_engine import TranslatorEngine
 
 
-def test_contextual_translation_uses_the_bounded_context_supplied_by_caller(monkeypatch):
+def test_contextual_translation_fallback_outputs_only_newest_turn(monkeypatch):
     engine = TranslatorEngine()
     captured = []
     monkeypatch.setattr(Config, "GEMINI_API_KEY", "")
@@ -18,8 +18,8 @@ def test_contextual_translation_uses_the_bounded_context_supplied_by_caller(monk
         ["ignored oldest", "first", "second", "third"]
     )
 
-    assert captured == ["ignored oldest first second third"]
-    assert result == "translated: ignored oldest first second third"
+    assert captured == ["third"]
+    assert result == "translated: third"
 
 
 def test_contextual_translation_is_readable_but_uses_more_than_three_fragments():

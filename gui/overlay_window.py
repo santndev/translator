@@ -10,7 +10,8 @@ import os
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QSlider, QGraphicsDropShadowEffect, QApplication, QCheckBox
+    QPushButton, QSlider, QGraphicsDropShadowEffect, QApplication, QCheckBox,
+    QAbstractButton, QAbstractSlider, QScrollBar
 )
 
 from PySide6.QtCore import Qt, QPoint, QRect, QTimer, Signal
@@ -22,6 +23,7 @@ from utils.logger import logger
 
 class OverlayWindow(QMainWindow):
     _WM_NCHITTEST = 0x0084
+    _HTCLIENT = 1
     _HTLEFT = 10
     _HTRIGHT = 11
     _HTTOP = 12
@@ -38,12 +40,15 @@ class OverlayWindow(QMainWindow):
     signal_stream1a_context = Signal(int, str, str)  # id, combined_en, contextual_vi
     signal_stream1b = Signal(int, str)        # utterance_id, explanation_text
     signal_stream1c = Signal(str)        # live word-by-word streaming text
+    signal_speaker = Signal(int, str)    # utterance_id, YOU/REMOTE/UNKNOWN
+    signal_speaker_partial = Signal(str, str)  # speaker, partial text
     signal_stream2a = Signal(int, str)        # utterance_id, keywords_text
     signal_stream2b = Signal(
         int, str, str, str, str, bool
     )  # id, quick_en, quick_vi, full_en, full_vi, should_reply
     signal_audio_activity = Signal(bool, float)  # is_capturing, volume_energy
     signal_partial_speech = Signal(str)  # live word-by-word streaming text
+    signal_ai_status = Signal(str, str)  # state, user-facing detail
     signal_recording_toggled = Signal(bool)
     signal_replay_action = Signal(str)
     signal_export_requested = Signal()
@@ -56,7 +61,7 @@ class OverlayWindow(QMainWindow):
         self._geometry_verified_after_show = False
         self._replay_button_state = "play"
         self._has_recording = False
-        self.state_file = os.path.join(os.path.dirname(__file__), "..", "window_state.json")
+        self.state_file = Config.WINDOW_STATE_PATH
         
         self.init_window_flags()
         self.init_ui()
@@ -91,6 +96,7 @@ class OverlayWindow(QMainWindow):
     def save_window_state(self):
         """Saves current window position and size to window_state.json."""
         try:
+            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
             state = {
                 "x": self.x(),
                 "y": self.y(),
@@ -262,6 +268,14 @@ class OverlayWindow(QMainWindow):
         self.lbl_title = QLabel("TRANSLATOR", self.status_title_box)
         self.lbl_title.setStyleSheet("color: #F1F5F9; font-weight: 700; font-size: 11px; letter-spacing: 0.5px;")
         st_layout.addWidget(self.lbl_title)
+
+        self.lbl_ai_status = QLabel("AI", self.status_title_box)
+        self.lbl_ai_status.setObjectName("AIStatus")
+        self.lbl_ai_status.setFixedSize(54, 20)
+        self.lbl_ai_status.setAlignment(Qt.AlignCenter)
+        self.lbl_ai_status.setAccessibleName("Trạng thái Gemini")
+        st_layout.addWidget(self.lbl_ai_status)
+        self.set_ai_status("online", "Gemini sẵn sàng")
 
         # Visual Audio Activity Indicator (Shows 🔊 Catching Sound in real-time)
         self.lbl_audio_wave = QLabel("🎙 Ready", self.status_title_box)
@@ -504,10 +518,15 @@ class OverlayWindow(QMainWindow):
         )
         self.signal_stream1b.connect(self.dashboard.update_stream1b)
         self.signal_stream1c.connect(self.dashboard.update_stream1c)
+        self.signal_speaker.connect(self.dashboard.update_speaker)
+        self.signal_speaker_partial.connect(
+            self.dashboard.update_speaker_partial
+        )
         self.signal_stream2a.connect(self.dashboard.update_stream2a)
         self.signal_stream2b.connect(self.dashboard.update_stream2b)
         self.signal_audio_activity.connect(self.on_audio_activity_changed)
         self.signal_partial_speech.connect(self.dashboard.update_partial_speech)
+        self.signal_ai_status.connect(self.set_ai_status)
 
 
 
@@ -537,6 +556,26 @@ class OverlayWindow(QMainWindow):
                 border: 1px solid transparent;
                 border-radius: 4px;
             """)
+
+    def set_ai_status(self, state: str, message: str):
+        """Show degraded AI without moving or blocking the fixed reading zones."""
+        presentations = {
+            "online": ("AI", "#86EFAC", "rgba(34,197,94,0.14)"),
+            "probing": ("AI RETRY", "#7DD3FC", "rgba(56,189,248,0.14)"),
+            "degraded": ("AI LOCAL", "#FDE68A", "rgba(245,158,11,0.16)"),
+            "local": ("AI LOCAL", "#FDE68A", "rgba(245,158,11,0.16)"),
+            "off": ("AI OFF", "#94A3B8", "rgba(148,163,184,0.12)"),
+        }
+        label, color, background = presentations.get(
+            state, presentations["degraded"]
+        )
+        self.lbl_ai_status.setText(label)
+        self.lbl_ai_status.setToolTip(message)
+        self.lbl_ai_status.setStyleSheet(
+            f"color:{color};background:{background};"
+            "border:1px solid rgba(255,255,255,0.10);border-radius:4px;"
+            "font-size:8px;font-weight:700;"
+        )
 
     def set_recording_state(self, active: bool, recording_path: str = ""):
         """Synchronize the header controls with recorder state."""
@@ -679,7 +718,14 @@ class OverlayWindow(QMainWindow):
                     screen_y = ctypes.c_short(
                         (packed_position >> 16) & 0xFFFF
                     ).value
-                    local_position = self.mapFromGlobal(QPoint(screen_x, screen_y))
+                    screen_position = QPoint(screen_x, screen_y)
+                    local_position = self._native_client_position(
+                        native_message.hWnd, screen_position
+                    )
+                    if self._is_interactive_child_at(local_position):
+                        # Controls at the outer edge must keep click/hover
+                        # semantics instead of becoming a resize handle.
+                        return True, self._HTCLIENT
                     hit = self._resize_hit_test(
                         local_position.x(),
                         local_position.y(),
@@ -691,6 +737,42 @@ class OverlayWindow(QMainWindow):
             except (OSError, TypeError, ValueError):
                 pass
         return super().nativeEvent(event_type, message)
+
+    def _native_client_position(
+        self, window_handle: int, screen_position: QPoint
+    ) -> QPoint:
+        """Convert a native hit-test point without crossing Qt DPI spaces.
+
+        ``WM_NCHITTEST`` coordinates are native screen coordinates. Qt's
+        ``mapFromGlobal`` can briefly use the previous monitor's scale after a
+        frameless window is restored, which makes controls look like resize
+        borders until the first move. ``ScreenToClient`` uses the HWND's active
+        monitor/DPI mapping and remains correct during that startup window.
+        """
+        if os.name == "nt":
+            try:
+                native_point = ctypes.wintypes.POINT(
+                    screen_position.x(), screen_position.y()
+                )
+                converted = ctypes.windll.user32.ScreenToClient(
+                    ctypes.wintypes.HWND(window_handle),
+                    ctypes.byref(native_point),
+                )
+                if converted:
+                    return QPoint(native_point.x, native_point.y)
+            except (AttributeError, OSError, TypeError, ValueError):
+                pass
+        return self.mapFromGlobal(screen_position)
+
+    def _is_interactive_child_at(self, position: QPoint) -> bool:
+        """Return whether a mouse control owns this client position."""
+        widget = self.childAt(position)
+        interactive_types = (QAbstractButton, QAbstractSlider, QScrollBar)
+        while widget is not None and widget is not self:
+            if isinstance(widget, interactive_types) and widget.isEnabled():
+                return True
+            widget = widget.parentWidget()
+        return False
 
     def _window_btn_style(self, hover_color: str = "#3B82F6") -> str:
         """Helper to generate stylesheet for window control buttons."""

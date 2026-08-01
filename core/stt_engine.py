@@ -4,9 +4,11 @@ Transcribes spoken audio from WASAPI Loopback / Microphone into English text.
 """
 import builtins
 import importlib
+import os
 import threading
 
 import numpy as np
+from config import Config
 from utils.logger import logger
 
 
@@ -56,7 +58,14 @@ class STTEngine:
         try:
             WhisperModel = self._import_whisper_model_class()
             logger.info(f"Loading Faster-Whisper model ({self.model_size}) in background...")
-            self._model = WhisperModel(self.model_size, device="cpu", compute_type="int8")
+            model_source = (
+                Config.WHISPER_MODEL_PATH
+                if os.path.isdir(Config.WHISPER_MODEL_PATH)
+                else self.model_size
+            )
+            self._model = WhisperModel(
+                model_source, device="cpu", compute_type="int8"
+            )
             self._is_loaded = True
             self._load_error = None
             logger.info("Faster-Whisper model loaded successfully and READY!")
@@ -82,9 +91,17 @@ class STTEngine:
                 # 1. Convert bytes to int16 numpy array
                 audio_int16 = np.frombuffer(audio_data, dtype=np.int16)
                 
-                # 2. Stereo to Mono channel averaging if multi-channel
-                if len(audio_int16) % 2 == 0:
-                    audio_mono = audio_int16.reshape(-1, 2).mean(axis=1)
+                # 2. Mix the declared source channels to mono. Inferring stereo
+                # from an even sample count corrupts ordinary mono microphone
+                # buffers, because virtually every PCM buffer has even length.
+                source_channels = max(1, int(channels))
+                usable_samples = (
+                    len(audio_int16) // source_channels * source_channels
+                )
+                if source_channels > 1 and usable_samples:
+                    audio_mono = audio_int16[:usable_samples].reshape(
+                        -1, source_channels
+                    ).mean(axis=1)
                 else:
                     audio_mono = audio_int16.astype(np.float32)
 

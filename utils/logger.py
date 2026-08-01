@@ -2,6 +2,8 @@ import logging
 import sys
 import os
 
+from config import Config
+
 
 def _configure_utf8_stream(stream):
     """Make redirected Windows console streams safe for Vietnamese text."""
@@ -27,7 +29,7 @@ def setup_logger(name="AppLogger"):
         logger.addHandler(console_handler)
         
         # File Handler for deep debugging
-        log_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'logs'))
+        log_dir = Config.LOG_DIR
         os.makedirs(log_dir, exist_ok=True)
         file_handler = logging.FileHandler(os.path.join(log_dir, 'app_debug.log'), encoding='utf-8')
         file_handler.setFormatter(formatter)

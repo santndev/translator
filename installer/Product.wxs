@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product
+      Id="*"
+      Name="Translator"
+      Language="1033"
+      Version="$(var.ProductVersion)"
+      Manufacturer="Translator"
+      UpgradeCode="B74A351C-1846-47CA-9329-39484E777EF8">
+    <Package
+        InstallerVersion="500"
+        Compressed="yes"
+        InstallScope="perMachine"
+        Platform="x64"
+        Description="Real-time English call assistant" />
+
+    <MajorUpgrade
+        DowngradeErrorMessage="A newer version of Translator is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="medium" />
+
+    <Icon Id="TranslatorIcon" SourceFile="$(var.ProjectRoot)\assets\app_icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="TranslatorIcon" />
+    <Property
+        Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT"
+        Value="Launch Translator" />
+    <Property
+        Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX"
+        Value="1" />
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="Translator" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder" />
+      <Directory Id="DesktopFolder" />
+    </Directory>
+
+    <DirectoryRef Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="4A3CD5E6-295C-4A84-8D6F-68B7F92D7E52" Win64="yes">
+        <Shortcut
+            Id="TranslatorStartMenuShortcut"
+            Name="Translator"
+            Description="Real-time English call assistant"
+            Target="[INSTALLFOLDER]Translator.exe"
+            WorkingDirectory="INSTALLFOLDER"
+            Icon="TranslatorIcon"
+            Advertise="no" />
+        <RegistryValue
+            Root="HKCU"
+            Key="Software\Translator"
+            Name="StartMenuShortcut"
+            Type="integer"
+            Value="1"
+            KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="DD8363C2-A317-4141-B3A7-16416D450D57" Win64="yes">
+        <Shortcut
+            Id="TranslatorDesktopShortcut"
+            Name="Translator"
+            Description="Real-time English call assistant"
+            Target="[INSTALLFOLDER]Translator.exe"
+            WorkingDirectory="INSTALLFOLDER"
+            Icon="TranslatorIcon"
+            Advertise="no" />
+        <RegistryValue
+            Root="HKCU"
+            Key="Software\Translator"
+            Name="DesktopShortcut"
+            Type="integer"
+            Value="1"
+            KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <CustomAction
+        Id="LaunchTranslator"
+        Directory="INSTALLFOLDER"
+        ExeCommand="&quot;[INSTALLFOLDER]Translator.exe&quot;"
+        Execute="immediate"
+        Impersonate="yes"
+        Return="asyncNoWait" />
+
+    <UI>
+      <UIRef Id="WixUI_Minimal" />
+      <Publish
+          Dialog="ExitDialog"
+          Control="Finish"
+          Event="DoAction"
+          Value="LaunchTranslator">
+        WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed
+      </Publish>
+    </UI>
+
+    <Feature Id="Complete" Title="Translator" Level="1">
+      <ComponentGroupRef Id="ApplicationFiles" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+
+  </Product>
+</Wix>

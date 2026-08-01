@@ -1,16 +1,44 @@
 """Standalone assertions for the Qt dashboard (invoked by pytest subprocess)."""
 
-from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import QRect, Qt
+import os
+import tempfile
 
-from gui.components.glanceable_dashboard import GlanceableDashboard
+from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtCore import QPoint, QRect, Qt
+from PySide6.QtTest import QTest
+
+from gui.components.glanceable_dashboard import (
+    GlanceableDashboard,
+    conversation_display_text,
+)
 from gui.overlay_window import OverlayWindow
+from config import Config
+
+
+_TEST_STATE_DIRECTORY = tempfile.TemporaryDirectory()
+Config.WINDOW_STATE_PATH = os.path.join(
+    _TEST_STATE_DIRECTORY.name, "window_state.json"
+)
 
 
 def make_dashboard() -> GlanceableDashboard:
     widget = GlanceableDashboard()
     widget.resize(840, 560)
     return widget
+
+
+def settle_scrolls(milliseconds: int = 220):
+    """Allow the smooth follower and deferred Qt layout passes to complete."""
+    QApplication.processEvents()
+    QTest.qWait(milliseconds)
+    QApplication.processEvents()
+
+
+def assert_at_bottom(scroll_bar, label: str = ""):
+    """Allow Qt's offscreen layout one transient scrollbar pixel."""
+    value = scroll_bar.value()
+    maximum = scroll_bar.maximum()
+    assert abs(maximum - value) <= 1, label
 
 
 def verify_grid_positions():
@@ -29,7 +57,7 @@ def verify_grid_positions():
     assert nested.itemAt(0).widget() is dashboard.translation_region
     assert nested.itemAt(1).widget() is dashboard.context_region
     assert nested.stretch(0) == 1
-    assert nested.stretch(1) == 2
+    assert nested.stretch(1) == 1
 
 
 def verify_live_stylesheet_is_well_formed():
@@ -91,6 +119,7 @@ def verify_translation_replaces_pending_result():
     dashboard = make_dashboard()
     english = "Can you describe the rollback plan?"
     dashboard.update_stream1a(7, english, "Đang dịch...")
+    assert dashboard.translation_region.history == []
     dashboard.update_stream1a(
         7, english, "Bạn có thể mô tả kế hoạch quay lui không?"
     )
@@ -171,10 +200,66 @@ def verify_live_keeps_a_long_rolling_transcript():
     )
 
 
+def verify_live_displays_stable_speaker_badges_and_parallel_partials():
+    dashboard = make_dashboard()
+    dashboard.update_speaker(1, "YOU")
+    dashboard.update_stream1a(1, "I will check that.", "Tôi sẽ kiểm tra.")
+    dashboard.update_speaker(2, "REMOTE")
+    dashboard.update_stream1a(2, "Thank you.", "Cảm ơn bạn.")
+    dashboard.update_speaker_partial("REMOTE", "Could you")
+    dashboard.update_speaker_partial("YOU", "Yes")
+
+    rendered = dashboard.live_region.content_label.text()
+    assert "[BẠN]" in rendered
+    assert "REMOTE" not in rendered
+    assert "🔊" in rendered
+    assert "Could you" in rendered
+    assert "Yes" in rendered
+    assert "🎙" not in rendered
+
+    dashboard.update_speaker_partial("YOU", "")
+    rendered = dashboard.live_region.content_label.text()
+    assert "Could you" in rendered
+    assert "🎙" not in rendered
+
+
+def verify_remote_labels_become_icons_in_conversation_views():
+    assert conversation_display_text("TỪ XA: Ý đầu tiên.") == "🔊 Ý đầu tiên."
+    assert conversation_display_text("XA: Nhãn bị sót.") == "🔊 Nhãn bị sót."
+    dashboard = make_dashboard()
+    dashboard.update_contextual_english(
+        2, "REMOTE: First point. BẠN: Got it. REMOTE: Second point."
+    )
+    dashboard.update_contextual_translation(
+        2,
+        "REMOTE: First point. BẠN: Got it. REMOTE: Second point.",
+        "TỪ XA: Ý đầu tiên.",
+    )
+
+    contextual_english = dashboard.live_region.context_label.text()
+    contextual_vietnamese = (
+        dashboard.contextual_translation_region.content_label.text()
+    )
+    assert "REMOTE" not in contextual_english
+    assert contextual_english.count("🔊") == 2
+    assert "TỪ XA" not in contextual_vietnamese
+    assert "🔊" in contextual_vietnamese
+
+
+def verify_empty_regions_do_not_show_processing_status():
+    dashboard = make_dashboard()
+    visible_text = " ".join(
+        [dashboard.live_region.content_label.text(),
+         dashboard.live_region.context_label.text()]
+        + [region.content_label.text() for region in dashboard.regions]
+    )
+    assert "Đang" not in visible_text
+
+
 def verify_live_region_is_split_into_equal_realtime_and_context_columns():
     dashboard = make_dashboard()
     dashboard.show()
-    QApplication.processEvents()
+    settle_scrolls()
 
     live = dashboard.live_region
     assert live.columns_layout.stretch(0) == 1
@@ -196,7 +281,7 @@ def verify_context_english_updates_and_rejects_stale_results():
         old_context,
         "Bản dịch mới",
     )
-    QApplication.processEvents()
+    settle_scrolls()
     context_bar = dashboard.live_region.context_scroll.verticalScrollBar()
     assert context_bar.maximum() > 0
     context_bar.setValue(0)
@@ -206,12 +291,12 @@ def verify_context_english_updates_and_rejects_stale_results():
         "This stale result must not replace the current context.",
         "Bản dịch cũ",
     )
-    QApplication.processEvents()
+    settle_scrolls()
 
     assert dashboard.live_region.contextual_english == current_context.strip()
     assert "Current English context" in dashboard.live_region.context_label.text()
     assert "stale result" not in dashboard.live_region.context_label.text()
-    assert context_bar.value() == context_bar.maximum()
+    assert_at_bottom(context_bar)
     dashboard.close()
 
 
@@ -230,7 +315,7 @@ def verify_new_content_returns_each_region_to_its_focus_anchor():
             utterance_id,
             f"keyword-{utterance_id} " + ("description " * 18),
         )
-    QApplication.processEvents()
+    settle_scrolls()
 
     live_bar = dashboard.live_region.scroll.verticalScrollBar()
     keyword_bar = dashboard.keywords_region.scroll.verticalScrollBar()
@@ -241,10 +326,10 @@ def verify_new_content_returns_each_region_to_its_focus_anchor():
 
     dashboard.update_stream1c("the newest live words")
     dashboard.update_stream2a(21, "newest keyword " + ("detail " * 30))
-    QApplication.processEvents()
+    settle_scrolls()
 
-    assert live_bar.value() == live_bar.maximum()
-    assert keyword_bar.value() == keyword_bar.maximum()
+    assert_at_bottom(live_bar)
+    assert_at_bottom(keyword_bar)
     dashboard.close()
 
 
@@ -257,7 +342,7 @@ def verify_new_contextual_translation_returns_to_its_focus_anchor():
         "Long English context",
         "Bản dịch cũ " + ("với rất nhiều nội dung để đọc " * 45),
     )
-    QApplication.processEvents()
+    settle_scrolls()
 
     context_bar = (
         dashboard.contextual_translation_region.scroll.verticalScrollBar()
@@ -269,9 +354,9 @@ def verify_new_contextual_translation_returns_to_its_focus_anchor():
         "New English context",
         "Bản dịch theo ngữ cảnh mới " + ("và phần giải thích " * 40),
     )
-    QApplication.processEvents()
+    settle_scrolls()
 
-    assert context_bar.value() == context_bar.maximum()
+    assert_at_bottom(context_bar)
     dashboard.close()
 
 
@@ -299,12 +384,46 @@ def verify_all_history_regions_follow_top_to_bottom_and_scroll_to_bottom():
             long_text,
             True,
         )
-    QApplication.processEvents()
+    # Wait through the short per-sentence pulse so the offscreen Qt layout has
+    # reached its final scrollbar range before asserting the bottom anchor.
+    settle_scrolls(900)
 
     for region in dashboard.regions:
         scroll_bar = region.scroll.verticalScrollBar()
         assert scroll_bar.maximum() > 0, region.title
-        assert scroll_bar.value() == scroll_bar.maximum(), region.title
+        assert_at_bottom(scroll_bar, region.title)
+    dashboard.close()
+
+
+def verify_bottom_follow_is_smooth_and_pin_stops_it():
+    dashboard = make_dashboard()
+    dashboard.resize(640, 500)
+    dashboard.show()
+    region = dashboard.keywords_region
+    for utterance_id in range(1, 5):
+        dashboard.update_stream2a(
+            utterance_id,
+            f"keyword-{utterance_id} " + ("long detail " * 100),
+        )
+    settle_scrolls()
+
+    scroll_bar = region.scroll.verticalScrollBar()
+    assert scroll_bar.maximum() > 10
+    scroll_bar.setValue(0)
+    dashboard.update_stream2a(5, "newest " + ("more detail " * 100))
+    QApplication.processEvents()
+
+    assert 0 < scroll_bar.value() < scroll_bar.maximum()
+    assert region._main_bottom_follow.is_animating
+    settle_scrolls()
+    assert_at_bottom(scroll_bar)
+
+    region.set_pinned(True)
+    scroll_bar.setValue(0)
+    dashboard.update_stream2a(6, "pinned update " + ("detail " * 100))
+    settle_scrolls()
+    assert scroll_bar.value() == 0
+    assert not region._main_bottom_follow.is_animating
     dashboard.close()
 
 
@@ -318,7 +437,7 @@ def verify_contextual_translation_keeps_bounded_scrollable_history():
             f"English context {utterance_id}",
             f"Bản dịch ngữ cảnh {utterance_id} " + ("nội dung dài " * 12),
         )
-    QApplication.processEvents()
+    settle_scrolls()
 
     region = dashboard.contextual_translation_region
     assert len(region.history) == 8
@@ -356,9 +475,47 @@ def verify_contextual_translation_uses_fixed_third_row():
             "Bản dịch kết hợp có ngữ cảnh",
         )
     ]
-    assert "font-size:14px" in (
+    assert "font-size:14px" not in (
         dashboard.contextual_translation_region.content_label.text()
     )
+
+
+def verify_each_history_region_has_independent_font_controls_after_pin():
+    dashboard = make_dashboard()
+    dashboard.update_font_scale(1.0)
+
+    for region in dashboard.regions:
+        pin_index = region.header_layout.indexOf(region.pin_button)
+        decrease_index = region.header_layout.indexOf(
+            region.font_decrease_button
+        )
+        increase_index = region.header_layout.indexOf(
+            region.font_increase_button
+        )
+        assert decrease_index < increase_index < pin_index
+        assert region.font_decrease_button.accessibleName().startswith(
+            "Giảm cỡ chữ"
+        )
+        assert region.font_increase_button.accessibleName().startswith(
+            "Tăng cỡ chữ"
+        )
+
+    target = dashboard.keywords_region
+    untouched = dashboard.context_region
+    target.font_increase_button.click()
+    assert target._font_scale == 1.1
+    assert untouched._font_scale == 1.0
+    assert "font-size: 13px" in target.content_label.styleSheet()
+
+    for _ in range(20):
+        target.font_increase_button.click()
+    assert target._font_scale == target.MAX_FONT_SCALE
+    assert not target.font_increase_button.isEnabled()
+    assert target.font_decrease_button.isEnabled()
+
+    target.font_decrease_button.click()
+    assert target._font_scale < target.MAX_FONT_SCALE
+    assert target.font_increase_button.isEnabled()
 
 
 def verify_frameless_window_resize_hit_regions():
@@ -368,6 +525,113 @@ def verify_frameless_window_resize_hit_regions():
     assert hit(0, 300, 800, 600) == OverlayWindow._HTLEFT
     assert hit(400, 0, 800, 600) == OverlayWindow._HTTOP
     assert hit(400, 300, 800, 600) == 0
+
+
+def verify_interactive_controls_override_resize_edges():
+    overlay = OverlayWindow()
+    overlay.save_window_state = lambda: None
+    overlay.resize(800, 600)
+    overlay.show()
+    edge_button = QPushButton("test", overlay)
+    edge_button.setGeometry(792, 200, 8, 24)
+    edge_button.show()
+    edge_button.raise_()
+    QApplication.processEvents()
+
+    point = edge_button.mapTo(overlay, QPoint(2, 10))
+    assert OverlayWindow._resize_hit_test(
+        point.x(), point.y(), overlay.width(), overlay.height()
+    ) == OverlayWindow._HTRIGHT
+    assert overlay._is_interactive_child_at(point)
+
+    region_button = overlay.dashboard.reply_region.font_increase_button
+    region_point = region_button.mapTo(
+        overlay, region_button.rect().center()
+    )
+    assert overlay._is_interactive_child_at(region_point)
+    overlay.close()
+
+
+def verify_native_hit_test_coordinates_survive_negative_monitor_origin():
+    overlay = OverlayWindow()
+    overlay.save_window_state = lambda: None
+    overlay.resize(800, 600)
+    overlay.move(392, -755)
+    overlay.show()
+    QApplication.processEvents()
+
+    button = overlay.dashboard.contextual_translation_region.pin_button
+    expected_client = button.mapTo(overlay, button.rect().center())
+    screen_position = button.mapToGlobal(button.rect().center())
+    native_client = overlay._native_client_position(
+        int(overlay.winId()), screen_position
+    )
+
+    assert native_client == expected_client
+    assert overlay._is_interactive_child_at(native_client)
+    overlay.close()
+
+
+def verify_new_content_pulses_without_changing_history_semantics():
+    dashboard = make_dashboard()
+    region = dashboard.translation_region
+    dashboard.update_stream1a(1, "First", "Câu đầu")
+    assert region._main_pulse.item_id == 1
+    assert "class='new-content-pulse'" in region.content_label.text()
+    assert "new-content-pulse" not in region.title_label.styleSheet()
+
+    dashboard.update_stream1a(2, "Second", "Câu thứ hai")
+    assert region._main_pulse.item_id == 2
+    assert region.history == [
+        ("First", "Câu đầu"),
+        ("Second", "Câu thứ hai"),
+    ]
+    assert dashboard.live_region._final_pulse.item_id == 2
+    rendered = region.content_label.text()
+    first_position = rendered.index("Câu đầu")
+    second_position = rendered.index("Câu thứ hai")
+    pulse_position = rendered.index("class='new-content-pulse'")
+    assert first_position < pulse_position < second_position
+
+    dashboard.update_stream1b(2, "Ngữ cảnh mới")
+    dashboard.update_stream2a(2, "keyword mới")
+    dashboard.update_stream2b(
+        2,
+        "Quick reply",
+        "Trả lời nhanh",
+        "Full reply",
+        "Trả lời đầy đủ",
+        True,
+    )
+    dashboard.update_contextual_translation(
+        2,
+        "First Second",
+        "Bản dịch mới có ngữ cảnh",
+    )
+    pulsing_labels = [
+        dashboard.context_region.content_label,
+        dashboard.keywords_region.content_label,
+        dashboard.reply_region.content_label,
+        dashboard.contextual_translation_region.content_label,
+        dashboard.live_region.context_label,
+    ]
+    assert all(
+        "class='new-content-pulse'" in label.text()
+        for label in pulsing_labels
+    )
+
+    QTest.qWait(900)
+    QApplication.processEvents()
+    assert region._main_pulse.item_id is None
+    assert "class='new-content-pulse'" not in region.content_label.text()
+    assert dashboard.live_region._final_pulse.item_id is None
+    assert "class='new-content-pulse'" not in (
+        dashboard.live_region.content_label.text()
+    )
+    assert all(
+        "class='new-content-pulse'" not in label.text()
+        for label in pulsing_labels
+    )
 
 
 def verify_no_reply_recommendation_is_rendered():
@@ -413,6 +677,13 @@ def verify_overlay_signals_preserve_ids():
     assert overlay.dashboard.live_region.contextual_english == (
         "Immediate rolling English context"
     )
+
+    overlay.signal_ai_status.emit(
+        "local", "Gemini tạm giới hạn — đang dùng chế độ local"
+    )
+    QApplication.processEvents()
+    assert overlay.lbl_ai_status.text() == "AI LOCAL"
+    assert "tạm giới hạn" in overlay.lbl_ai_status.toolTip()
 
 
 def verify_offscreen_window_state_is_clamped():
@@ -467,17 +738,25 @@ if __name__ == "__main__":
     verify_live_never_freezes()
     verify_live_is_rendered_oldest_to_current()
     verify_live_keeps_a_long_rolling_transcript()
+    verify_live_displays_stable_speaker_badges_and_parallel_partials()
     verify_live_region_is_split_into_equal_realtime_and_context_columns()
     verify_context_english_updates_and_rejects_stale_results()
     verify_new_content_returns_each_region_to_its_focus_anchor()
     verify_new_contextual_translation_returns_to_its_focus_anchor()
     verify_all_history_regions_follow_top_to_bottom_and_scroll_to_bottom()
+    verify_bottom_follow_is_smooth_and_pin_stops_it()
     verify_contextual_translation_keeps_bounded_scrollable_history()
     verify_contextual_translation_uses_fixed_third_row()
+    verify_each_history_region_has_independent_font_controls_after_pin()
     verify_frameless_window_resize_hit_regions()
+    verify_interactive_controls_override_resize_edges()
+    verify_native_hit_test_coordinates_survive_negative_monitor_origin()
+    verify_new_content_pulses_without_changing_history_semantics()
     verify_no_reply_recommendation_is_rendered()
     verify_overlay_signals_preserve_ids()
     verify_offscreen_window_state_is_clamped()
     verify_session_controls_have_stable_states_and_accessible_names()
+    verify_remote_labels_become_icons_in_conversation_views()
+    verify_empty_regions_do_not_show_processing_status()
     app.processEvents()
     print("All glanceable dashboard checks passed.")

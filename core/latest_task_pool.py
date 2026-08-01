@@ -76,3 +76,13 @@ class LatestTaskPool:
         for future in futures:
             future.cancel()
         self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def invalidate(self, stream: str, generation: int) -> None:
+        """Suppress any older result without scheduling replacement work."""
+        with self._lock:
+            if self._closed:
+                return
+            self._latest_generation[stream] = generation
+            previous = self._futures.pop(stream, None)
+        if previous is not None and not previous.done():
+            previous.cancel()

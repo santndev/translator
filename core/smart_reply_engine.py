@@ -11,9 +11,9 @@ from core.dynamic_ai_generator import DynamicAIGenerator
 from utils.logger import logger
 
 class SmartReplyEngine:
-    def __init__(self):
+    def __init__(self, gemini_client=None):
         self.context_history = []
-        self.ai_generator = DynamicAIGenerator()
+        self.ai_generator = DynamicAIGenerator(gemini_client=gemini_client)
 
     def generate_stream_bundle(self, english_text: str) -> dict:
         """Generate explanation, keywords, and reply in one model invocation."""

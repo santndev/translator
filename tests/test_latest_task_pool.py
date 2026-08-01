@@ -57,3 +57,24 @@ def test_worker_count_stays_bounded_under_burst_load():
     assert len(worker_threads) <= 2
     release.set()
     pool.shutdown()
+
+
+def test_invalidate_suppresses_running_result_without_replacement():
+    pool = LatestTaskPool(max_workers=1)
+    started = threading.Event()
+    release = threading.Event()
+    published = []
+
+    def work():
+        started.set()
+        assert release.wait(timeout=2)
+        return "obsolete reply"
+
+    pool.submit_latest("assistance", 4, work, published.append)
+    assert started.wait(timeout=1)
+    pool.invalidate("assistance", 5)
+    release.set()
+    time.sleep(0.05)
+
+    assert published == []
+    pool.shutdown()

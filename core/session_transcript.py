@@ -20,8 +20,10 @@ class SessionTranscript:
         self._items: OrderedDict[int, dict[str, object]] = OrderedDict()
         self._lock = threading.RLock()
 
-    def record_english(self, utterance_id: int, english: str) -> None:
-        self._update(utterance_id, english=english)
+    def record_english(
+        self, utterance_id: int, english: str, speaker: str = "REMOTE"
+    ) -> None:
+        self._update(utterance_id, english=english, speaker=speaker)
 
     def record_translation(self, utterance_id: int, vietnamese: str) -> None:
         self._update(utterance_id, vietnamese=vietnamese)
@@ -76,6 +78,7 @@ class SessionTranscript:
             lines.extend(
                 [
                     f"[{utterance_id:03d}]",
+                    f"Speaker: {item.get('speaker', 'REMOTE')}",
                     f"English: {item.get('english', '')}",
                     f"Vietnamese: {item.get('vietnamese', '')}",
                     "Contextual Vietnamese: "

@@ -8,6 +8,7 @@ import json
 from utils.logger import logger
 
 from core.dynamic_ai_generator import DynamicAIGenerator
+from core.gemini_client import GeminiClient
 
 class TranslatorEngine:
     CONTEXT_TRANSLATION_MAX_CHARS = 700
@@ -56,10 +57,11 @@ class TranslatorEngine:
         "websocket": "kết nối hai chiều",
     }
 
-    def __init__(self):
+    def __init__(self, gemini_client=None):
         # Free Google Translate RPC Endpoint
         self.gt_url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=vi&dt=t&q="
-        self.ai_generator = DynamicAIGenerator()
+        self.gemini = gemini_client or GeminiClient()
+        self.ai_generator = DynamicAIGenerator(gemini_client=self.gemini)
 
     def translate_en_to_vi(self, english_text: str) -> str:
         """
@@ -79,16 +81,40 @@ class TranslatorEngine:
             return f"(Dịch tự động: {english_text})"
 
     def translate_contextual_en_to_vi(self, recent_utterances: list[str]) -> str:
-        """Translate the bounded recent conversation as one coherent passage."""
+        """Translate the newest turn using bounded prior conversation context."""
         context = self._select_readable_translation_context(recent_utterances)
         if not context:
             return ""
 
-        combined_text = " ".join(context)
-        from config import Config
+        newest_text = context[-1]
+        if not self.gemini.is_configured:
+            return self.translate_en_to_vi(newest_text)
 
-        if not Config.GEMINI_API_KEY:
-            return self.translate_en_to_vi(combined_text)
+        dialogue = "\n".join(
+            f"{index + 1}. {text}" for index, text in enumerate(context)
+        )
+        prompt = (
+            "Translate only the FINAL line of this recent English conversation "
+            "into natural Vietnamese for quick reading. Use all earlier lines "
+            "only to resolve pronouns, omitted subjects, terminology, and "
+            "sentence fragments. Make the final translation understandable "
+            "on its own, but do not repeat or summarize earlier turns. "
+            "Preserve technical meaning, SQL/code/identifiers, and punctuation "
+            "that belongs to code. Translate ordinary technical prose naturally "
+            "from context rather than applying a fixed glossary. Do not explain, "
+            "summarize, or add facts. Return Vietnamese text only.\n\n"
+            f"{dialogue}"
+        )
+        try:
+            return self.gemini.generate_text(
+                prompt, max_output_tokens=1200, thinking_level="minimal"
+            ).strip()
+        except Exception as error:
+            logger.warning(
+                "Contextual translation fallback to combined translation: "
+                f"{error}"
+            )
+            return self.translate_en_to_vi(newest_text)
 
     @classmethod
     def _select_readable_translation_context(
@@ -159,39 +185,6 @@ class TranslatorEngine:
             )
             for term in display_terms
         )
-
-        try:
-            url = (
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"gemini-1.5-flash:generateContent?key={Config.GEMINI_API_KEY}"
-            )
-            dialogue = "\n".join(
-                f"{index + 1}. {text}" for index, text in enumerate(context)
-            )
-            prompt = (
-                "Translate the following recent English conversation into one "
-                "natural, coherent Vietnamese passage. Resolve pronouns and "
-                "sentence fragments using earlier lines. Preserve the meaning; "
-                "return Vietnamese text only.\n\n"
-                f"{dialogue}"
-            )
-            payload = json.dumps(
-                {"contents": [{"parts": [{"text": prompt}]}]}
-            ).encode("utf-8")
-            request = urllib.request.Request(
-                url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(request, timeout=5) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        except Exception as error:
-            logger.warning(
-                f"Contextual translation fallback to combined translation: {error}"
-            )
-            return self.translate_en_to_vi(combined_text)
 
     def explain_context_vi(self, english_text: str, vi_translation: str = "") -> str:
         """
