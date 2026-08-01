@@ -6,4 +6,5 @@ __pycache__/
 .vscode/
 .idea/
 *.log
+logs/
 window_state.json

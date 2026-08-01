@@ -5,26 +5,33 @@ Uses PyAudioPatch on Windows for native loopback audio stream recording.
 """
 import time
 import threading
+import math
 import numpy as np
 import json
 import os
 import vosk
+from config import Config
 from utils.logger import logger
 
 class AudioCapturer:
-    def __init__(self, callback_on_speech=None, stt_engine=None, callback_audio_activity=None, callback_partial_speech=None):
+    def __init__(self, callback_on_speech=None, stt_engine=None, callback_audio_activity=None, callback_partial_speech=None, callback_recording_audio=None):
         """
         callback_on_speech: Function(channel_type: str, text_payload: str, raw_pcm_bytes: bytes)
         callback_audio_activity: Function(is_capturing: bool, volume: float)
         callback_partial_speech: Function(channel_type: str, partial_text: str)
+        callback_recording_audio: Function(pcm_bytes: bytes, sample_rate: int, channels: int)
         """
         self.callback = callback_on_speech
         self.stt_engine = stt_engine
         self.callback_audio_activity = callback_audio_activity
         self.callback_partial_speech = callback_partial_speech
+        self.callback_recording_audio = callback_recording_audio
+        self._processing_enabled = threading.Event()
+        self._processing_enabled.set()
         self.is_running = False
         self._threads = []
         self.pyaudio_instance = None
+        self._active_stream = None
         
         # Initialize Vosk Model for Zero-Latency Stream 1c
         vosk.SetLogLevel(-1) # Disable verbose logs
@@ -63,7 +70,43 @@ class AudioCapturer:
         self._threads.append(t_loopback)
 
     def _capture_wasapi_loopback(self):
-        """Worker thread that records system audio (Speakers / YouTube) via WASAPI loopback."""
+        """Keep the loopback session alive across stalled streams/device resets."""
+        restart_count = 0
+        while self.is_running:
+            try:
+                self._run_wasapi_loopback_session()
+                return
+            except Exception as error:
+                restart_count += 1
+                logger.warning(
+                    "Restarting WASAPI loopback session "
+                    f"(attempt {restart_count}): {error}"
+                )
+                if self.callback_audio_activity:
+                    self.callback_audio_activity(False, 0.0)
+            finally:
+                stream = self._active_stream
+                self._active_stream = None
+                if stream is not None:
+                    try:
+                        stream.stop_stream()
+                    except Exception:
+                        pass
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                if self.pyaudio_instance is not None:
+                    try:
+                        self.pyaudio_instance.terminate()
+                    except Exception:
+                        pass
+                    self.pyaudio_instance = None
+            if self.is_running:
+                time.sleep(min(2.0, 0.25 * restart_count))
+
+    def _run_wasapi_loopback_session(self):
+        """Record one WASAPI session; raise when it stalls so caller reconnects."""
         try:
             import pyaudiowpatch as pyaudio
             p = pyaudio.PyAudio()
@@ -99,11 +142,26 @@ class AudioCapturer:
                 input_device_index=loopback_device["index"],
                 frames_per_buffer=1024
             )
+            self._active_stream = stream
 
             audio_buffer = bytearray()
             silence_counter = 0
             speaking = False
-            threshold = 350  # VAD energy threshold for speech detection
+            latest_vosk_text = ""
+            vosk_final_parts = []
+            noise_floor = 40.0
+            threshold = 112.0
+            (
+                silence_chunks_threshold,
+                max_utterance_bytes,
+                minimum_utterance_bytes,
+            ) = self._calculate_vad_limits(
+                sample_rate,
+                channels,
+            )
+            read_error_count = 0
+            monitor_started = time.monotonic()
+            monitor_peak = 0.0
             
             # Initialize Vosk Recognizer at 16000Hz
             vosk_recognizer = vosk.KaldiRecognizer(self.vosk_model, 16000) if getattr(self, 'vosk_model', None) else None
@@ -112,13 +170,48 @@ class AudioCapturer:
 
             while self.is_running:
                 try:
+                    available_frames = stream.get_read_available()
+                    if available_frames < 1024:
+                        now = time.monotonic()
+                        if now - monitor_started >= 10.0:
+                            logger.info(
+                                "WASAPI audio monitor: no frames available; "
+                                "waiting for output audio"
+                            )
+                            monitor_started = now
+                        time.sleep(0.005)
+                        continue
                     data = stream.read(1024, exception_on_overflow=False)
+                    read_error_count = 0
                     if not data:
+                        continue
+
+                    if self.callback_recording_audio:
+                        try:
+                            self.callback_recording_audio(data, sample_rate, channels)
+                        except Exception as error:
+                            logger.warning(f"Could not append recording audio: {error}")
+
+                    if not self._processing_enabled.is_set():
+                        audio_buffer = bytearray()
+                        silence_counter = 0
+                        speaking = False
+                        latest_vosk_text = ""
+                        vosk_final_parts = []
+                        if vosk_recognizer:
+                            vosk_recognizer.Reset()
+                        time.sleep(0.005)
                         continue
 
                     # Energy VAD check
                     audio_np = np.frombuffer(data, dtype=np.int16)
                     energy = float(np.abs(audio_np).mean()) if len(audio_np) > 0 else 0.0
+                    monitor_peak = max(monitor_peak, energy)
+                    if not speaking:
+                        noise_floor = 0.98 * noise_floor + 0.02 * min(
+                            energy, 1000.0
+                        )
+                    threshold = min(350.0, max(90.0, noise_floor * 2.8))
 
                     # Zero-Latency Stream 1c using Vosk
                     is_phrase_boundary = False
@@ -137,12 +230,22 @@ class AudioCapturer:
                             res = json.loads(vosk_recognizer.Result())
                             final_text = res.get("text", "").strip()
                             if final_text:
-                                self.callback_partial_speech("incoming", final_text)
+                                if not vosk_final_parts or vosk_final_parts[-1] != final_text:
+                                    vosk_final_parts.append(final_text)
+                                latest_vosk_text = " ".join(vosk_final_parts)
+                                self.callback_partial_speech(
+                                    "incoming", latest_vosk_text
+                                )
                         else:
                             partial = json.loads(vosk_recognizer.PartialResult())
                             partial_str = partial.get("partial", "").strip()
                             if partial_str:
-                                self.callback_partial_speech("incoming", partial_str)
+                                latest_vosk_text = " ".join(
+                                    [*vosk_final_parts, partial_str]
+                                ).strip()
+                                self.callback_partial_speech(
+                                    "incoming", latest_vosk_text
+                                )
 
                     if energy > threshold:
                         audio_buffer.extend(data)
@@ -161,49 +264,93 @@ class AudioCapturer:
                             if self.callback_audio_activity:
                                 self.callback_audio_activity(True, energy)
                                 
-                    # Trigger Faster-Whisper when Vosk detects a semantic boundary OR fallback silence
-                    if (is_phrase_boundary and speaking) or (speaking and silence_counter > 5):
+                    # A Vosk boundary is useful for live text, but is too eager to
+                    # define a semantic utterance. Flush after a real pause or a
+                    # correctly calculated eight-second safety bound.
+                    force_flush = len(audio_buffer) >= max_utterance_bytes
+                    if (
+                        speaking
+                        and silence_counter >= silence_chunks_threshold
+                    ) or force_flush:
                         pcm_bytes = bytes(audio_buffer)
+                        vosk_fallback_text = latest_vosk_text
                         audio_buffer = bytearray()
                         speaking = False
                         silence_counter = 0
+                        latest_vosk_text = ""
+                        vosk_final_parts = []
                         
                         # Emit empty string to tell UnderstandingWidget to push current phrase to rolling buffer
                         if self.callback_partial_speech:
                             self.callback_partial_speech("incoming", "")
                             
-                        # If Vosk didn't trigger this naturally (fallback timeout), forcefully reset it
-                        if not is_phrase_boundary and vosk_recognizer:
+                        if vosk_recognizer:
                             vosk_recognizer.Reset()
 
                         if self.callback_audio_activity:
                             self.callback_audio_activity(False, 0.0)
 
                         # Transcribe full accurate speech phrase
-                        if len(pcm_bytes) > sample_rate * 0.3 * 2:  # Min 0.3s speech
-                            self._process_captured_audio("incoming", pcm_bytes, sample_rate)
+                        if len(pcm_bytes) >= minimum_utterance_bytes:
+                            self._process_captured_audio(
+                                "incoming",
+                                pcm_bytes,
+                                sample_rate,
+                                fallback_text=vosk_fallback_text,
+                            )
 
                     elif not speaking:
                         if self.callback_audio_activity and time.time() % 0.5 < 0.1:
                             self.callback_audio_activity(False, 0.0)
 
+                    if time.monotonic() - monitor_started >= 10.0:
+                        logger.info(
+                            "WASAPI audio monitor: "
+                            f"peak={monitor_peak:.0f}, vad_threshold={threshold:.0f}"
+                        )
+                        monitor_started = time.monotonic()
+                        monitor_peak = 0.0
+
                 except Exception as e:
+                    read_error_count += 1
+                    if read_error_count == 1 or read_error_count % 10 == 0:
+                        logger.warning(
+                            f"WASAPI stream read error ({read_error_count}): {e}"
+                        )
+                    if read_error_count >= 20:
+                        raise RuntimeError(
+                            "WASAPI stream failed repeatedly"
+                        ) from e
                     time.sleep(0.01)
 
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
-
         except Exception as e:
-            logger.error(f"WASAPI Loopback capture worker error: {e}")
+            raise RuntimeError(f"WASAPI loopback session failed: {e}") from e
 
-    def _process_captured_audio(self, channel_type: str, pcm_bytes: bytes, sample_rate: int):
+    def _process_captured_audio(
+        self,
+        channel_type: str,
+        pcm_bytes: bytes,
+        sample_rate: int,
+        fallback_text: str = "",
+    ):
         """Transcribes PCM audio bytes and triggers speech callback."""
         logger.info(f"Captured {len(pcm_bytes)} bytes of speech on channel '{channel_type}'. Transcribing...")
         
         text = ""
-        if self.stt_engine:
+        stt_ready = bool(
+            self.stt_engine
+            and getattr(self.stt_engine, "is_ready", False)
+        )
+        if stt_ready:
             text = self.stt_engine.transcribe_audio_pcm(pcm_bytes, sample_rate=sample_rate)
+
+        text = self._normalize_transcript(text)
+        normalized_fallback = self._normalize_transcript(fallback_text)
+
+        if not text and normalized_fallback:
+            text = normalized_fallback
+            reason = "Whisper returned no text" if stt_ready else "Whisper is still loading"
+            logger.info(f"{reason}; using Vosk final transcript: '{text}'")
 
         if text and text.strip():
             logger.info(f"Transcribed '{channel_type}' speech: '{text.strip()}'")
@@ -211,6 +358,37 @@ class AudioCapturer:
                 self.callback(channel_type, text.strip(), pcm_bytes)
         else:
             logger.info("Speech transcription was empty or noise.")
+
+    @staticmethod
+    def _normalize_transcript(text: str) -> str:
+        """Reject punctuation-only and non-semantic speech fragments."""
+        normalized = " ".join((text or "").strip().split())
+        if not normalized or not any(character.isalnum() for character in normalized):
+            return ""
+        filler = normalized.lower().strip(".,!?… ")
+        if filler in {"uh", "um", "hmm", "mm", "ah", "er"}:
+            return ""
+        return normalized
+
+    @staticmethod
+    def _calculate_vad_limits(
+        sample_rate: int, channels: int
+    ) -> tuple[int, int, int]:
+        silence_chunks = max(
+            1,
+            math.ceil(
+                Config.VAD_SILENCE_THRESHOLD_MS
+                * sample_rate
+                / 1000
+                / 1024
+            ),
+        )
+        bytes_per_second = sample_rate * channels * 2
+        return (
+            silence_chunks,
+            bytes_per_second * 8,
+            int(bytes_per_second * 0.45),
+        )
 
     def inject_mock_audio(self, channel_type: str, text_payload: str, raw_pcm_bytes: bytes = None):
         """Injects mock audio/text payload into the capture pipeline for automated testing."""
@@ -220,6 +398,24 @@ class AudioCapturer:
         if self.callback:
             self.callback(channel_type, text_payload, raw_pcm_bytes)
 
+    def set_processing_enabled(self, enabled: bool) -> None:
+        """Pause/resume STT while capture remains alive (used during replay)."""
+        if enabled:
+            self._processing_enabled.set()
+        else:
+            self._processing_enabled.clear()
+            if self.callback_partial_speech:
+                self.callback_partial_speech("incoming", "")
+            if self.callback_audio_activity:
+                self.callback_audio_activity(False, 0.0)
+        logger.info(f"Audio speech processing {'enabled' if enabled else 'paused'}.")
+
     def stop_capture(self):
         self.is_running = False
+        stream = self._active_stream
+        if stream is not None:
+            try:
+                stream.stop_stream()
+            except Exception:
+                pass
         logger.info("Audio Capture Engine stopped.")

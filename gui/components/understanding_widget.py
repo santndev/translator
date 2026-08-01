@@ -95,16 +95,6 @@ class UnderstandingWidget(QWidget):
         self.scroll_1a, self.lbl_1a = self._create_scroll_area(self.main_box)
         self.scroll_1b, self.lbl_1b = self._create_scroll_area(self.main_box)
 
-        # Attach graphics opacity effects to text labels
-        self.effect_1c = QGraphicsOpacityEffect(self.lbl_1c)
-        self.lbl_1c.setGraphicsEffect(self.effect_1c)
-
-        self.effect_1a = QGraphicsOpacityEffect(self.lbl_1a)
-        self.lbl_1a.setGraphicsEffect(self.effect_1a)
-
-        self.effect_1b = QGraphicsOpacityEffect(self.lbl_1b)
-        self.lbl_1b.setGraphicsEffect(self.effect_1b)
-
         left_layout = QVBoxLayout()
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.addWidget(self.scroll_1c, 1)
@@ -242,7 +232,27 @@ class UnderstandingWidget(QWidget):
         self._render_stream1b()
 
     def update_text_opacity(self, opacity: float):
-        """Updates text opacity (0.1 to 1.0) of all stream 1 labels."""
-        self.effect_1c.setOpacity(opacity)
-        self.effect_1a.setOpacity(opacity)
-        self.effect_1b.setOpacity(opacity)
+        """Updates text opacity safely via CSS RGBA to avoid breaking PySide layout engines."""
+        from utils.helpers import apply_opacity_to_hex
+        self.color_en = apply_opacity_to_hex(getattr(Config, 'COLOR_ENGLSH_SUB', '#63B3ED'), opacity)
+        self.color_vi = apply_opacity_to_hex(getattr(Config, 'COLOR_VIET_SUB', '#F6AD55'), opacity)
+        self.color_exp = apply_opacity_to_hex(getattr(Config, 'COLOR_EXPLANATION', '#E9D8A6'), opacity)
+
+        self.color_1c = apply_opacity_to_hex('#E0F2FE', opacity)
+        self.color_1c_pending = apply_opacity_to_hex('#7DD3FC', opacity)
+
+        self._render_stream1c()
+        self._render_stream1a()
+        self._render_stream1b()
+
+    def update_window_opacity(self, opacity_multiplier: float):
+        """Fades out the main box background and border based on window opacity."""
+        bg_alpha = int(255 * 0.04 * opacity_multiplier)
+        border_alpha = int(255 * 0.08 * opacity_multiplier)
+        self.main_box.setStyleSheet(f"""
+            QFrame#MainBox {{
+                background-color: rgba(255, 255, 255, {bg_alpha});
+                border: 1px solid rgba(255, 255, 255, {border_alpha});
+                border-radius: 10px;
+            }}
+        """)

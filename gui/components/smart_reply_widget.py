@@ -134,7 +134,7 @@ class SmartReplyWidget(QWidget):
             color: {getattr(Config, 'COLOR_REPLY_EN', '#68D391')};
             font-size: 13px;
             font-weight: bold;
-            line-height: 1.4;
+
             padding: 2px 0px;
         """)
         reply_content_layout.addWidget(self.lbl_reply_en)
@@ -146,24 +146,18 @@ class SmartReplyWidget(QWidget):
             color: {getattr(Config, 'COLOR_REPLY_VI', '#CBD5E0')};
             font-size: 12px;
             font-style: italic;
-            line-height: 1.4;
+
             padding: 2px 0px 4px 0px;
         """)
         reply_content_layout.addWidget(self.lbl_reply_vi)
 
         self.reply_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.reply_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.reply_scroll.setWidgetResizable(True)
         self.reply_scroll.setWidget(reply_content)
         self.reply_scroll.setMinimumHeight(75)
-        # Attach opacity effects to stream 2 text and keyword badges
-        self.effect_keywords = QGraphicsOpacityEffect(self.keywords_container)
-        self.keywords_container.setGraphicsEffect(self.effect_keywords)
 
-        self.effect_reply_en = QGraphicsOpacityEffect(self.lbl_reply_en)
-        self.lbl_reply_en.setGraphicsEffect(self.effect_reply_en)
-
-        self.effect_reply_vi = QGraphicsOpacityEffect(self.lbl_reply_vi)
-        self.lbl_reply_vi.setGraphicsEffect(self.effect_reply_vi)
+        card_layout.addWidget(self.reply_scroll)
 
         layout.addWidget(self.reply_card, 1)
 
@@ -231,14 +225,14 @@ class SmartReplyWidget(QWidget):
             color: {getattr(Config, 'COLOR_REPLY_EN', '#68D391')};
             font-size: {sz_en}px;
             font-weight: bold;
-            line-height: 1.4;
+
             padding: 2px 0px;
         """)
         self.lbl_reply_vi.setStyleSheet(f"""
             color: {getattr(Config, 'COLOR_REPLY_VI', '#CBD5E0')};
             font-size: {sz_vi}px;
             font-style: italic;
-            line-height: 1.4;
+
             padding: 2px 0px 4px 0px;
         """)
 
@@ -259,6 +253,18 @@ class SmartReplyWidget(QWidget):
                     }}
                 """)
 
+    def update_window_opacity(self, opacity_multiplier: float):
+        """Fades out the reply card background and border based on window opacity."""
+        bg_alpha = int(255 * 0.07 * opacity_multiplier)
+        border_alpha = int(255 * 0.25 * opacity_multiplier)
+        self.reply_card.setStyleSheet(f"""
+            QFrame#ReplyCard {{
+                background-color: rgba(16, 185, 129, {bg_alpha});
+                border: 1px solid rgba(16, 185, 129, {border_alpha});
+                border-radius: 10px;
+            }}
+        """)
+
     def on_copy_clicked(self):
 
         """Copies the English reply to Windows clipboard."""
@@ -268,9 +274,40 @@ class SmartReplyWidget(QWidget):
             QTimer.singleShot(1500, lambda: self.btn_copy.setText("📋 Copy"))
 
     def update_text_opacity(self, opacity: float):
-        """Updates text opacity (0.1 to 1.0) of stream 2 keywords & reply labels."""
-        self.effect_keywords.setOpacity(opacity)
-        self.effect_reply_en.setOpacity(opacity)
-        self.effect_reply_vi.setOpacity(opacity)
+        """Updates text opacity safely via CSS RGBA."""
+        from utils.helpers import apply_opacity_to_hex
 
+        color_en = apply_opacity_to_hex(getattr(Config, 'COLOR_REPLY_EN', '#68D391'), opacity)
+        self.lbl_reply_en.setStyleSheet(f"""
+            color: {color_en};
+            font-size: {max(12, min(22, int(round(13 * self.current_scale))))}px;
+            font-weight: bold;
+            padding: 2px 0px;
+        """)
 
+        color_vi = apply_opacity_to_hex(getattr(Config, 'COLOR_REPLY_VI', '#CBD5E0'), opacity)
+        self.lbl_reply_vi.setStyleSheet(f"""
+            color: {color_vi};
+            font-size: {max(11, min(17, int(round(12 * self.current_scale))))}px;
+            font-style: italic;
+            padding: 2px 0px 4px 0px;
+        """)
+
+        bg_color = apply_opacity_to_hex("#10B98126", opacity)
+        text_color = apply_opacity_to_hex("#10B981", opacity)
+        border_color = apply_opacity_to_hex("#10B9814D", opacity)
+
+        for i in range(self.chips_layout.count()):
+            item = self.chips_layout.itemAt(i)
+            if item.widget() and isinstance(item.widget(), QLabel):
+                item.widget().setStyleSheet(f"""
+                    QLabel {{
+                        background-color: {bg_color};
+                        color: {text_color};
+                        border: 1px solid {border_color};
+                        border-radius: {int(12 * self.current_scale)}px;
+                        padding: {int(4 * self.current_scale)}px {int(10 * self.current_scale)}px;
+                        font-size: {int(11 * self.current_scale)}px;
+                        font-weight: 600;
+                    }}
+                """)

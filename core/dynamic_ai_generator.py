@@ -7,7 +7,6 @@ import re
 import time
 import urllib.request
 import json
-import random
 from config import Config
 from utils.logger import logger
 
@@ -27,8 +26,11 @@ class DynamicAIGenerator:
             return {
                 "stream_1b": "Đang chờ âm thanh...",
                 "stream_2a": "Keywords",
+                "stream_2b_quick_en": "One moment, please.",
+                "stream_2b_quick_vi": "(Xin chờ tôi một chút.)",
                 "stream_2b_en": "Waiting for input...",
-                "stream_2b_vi": "(Đang chờ dữ liệu đầu vào...)"
+                "stream_2b_vi": "(Đang chờ dữ liệu đầu vào...)",
+                "stream_2b_should_reply": False,
             }
 
         # Try Gemini / Cloud LLM API if key is present
@@ -46,11 +48,14 @@ class DynamicAIGenerator:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={Config.GEMINI_API_KEY}"
         prompt = (
             f"Analyze this technical interview/call statement: '{english_text}'\n"
-            "Return JSON with 4 keys:\n"
+            "Return JSON with 7 keys:\n"
             "1. 'stream_1b': 1-line Vietnamese explanation of what the speaker is asking/meaning.\n"
             "2. 'stream_2a': 4 to 6 core technical keywords separated by semicolons.\n"
-            "3. 'stream_2b_en': A polished, professional 2-sentence English answer addressing the specific trade-offs and concepts.\n"
-            "4. 'stream_2b_vi': Vietnamese translation of the English answer in parentheses.\n"
+            "3. 'stream_2b_quick_en': A safe, natural English reply of at most 10 words that buys time or acknowledges the speaker.\n"
+            "4. 'stream_2b_quick_vi': Vietnamese translation of the quick reply.\n"
+            "5. 'stream_2b_en': A polished professional answer of at most 2 short sentences. Do not invent facts; ask for clarification when context is insufficient.\n"
+            "6. 'stream_2b_vi': Vietnamese translation of the full answer.\n"
+            "7. 'stream_2b_should_reply': boolean. False for fillers, closings, acknowledgements, or informational updates that do not require a response. When false, return empty quick/full English replies.\n"
             "Return valid raw JSON only without markdown formatting."
         )
         req_data = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode('utf-8')
@@ -68,7 +73,9 @@ class DynamicAIGenerator:
         Parses topics, constraints, design patterns, and technical nouns dynamically.
         Builds contextual keywords, context explanation, and professional answers.
         """
+        latest_text = english_text.split("\nPrevious context:", 1)[0].strip()
         text_clean = re.sub(r'[^\w\s-]', ' ', english_text.lower())
+        latest_clean = re.sub(r'[^\w\s-]', ' ', latest_text.lower())
         words = text_clean.split()
         
         # Stopwords filter
@@ -81,11 +88,19 @@ class DynamicAIGenerator:
             "not", "only", "own", "same", "so", "than", "too", "very", "can", "will", "just",
             "don", "should", "now", "you", "your", "yours", "would", "could", "this", "that",
             "these", "those", "am", "is", "are", "was", "were", "be", "been", "being", "have",
-            "has", "had", "having", "do", "does", "did", "doing", "what", "which", "who", "whom"
+            "has", "had", "having", "do", "does", "did", "doing", "what", "which", "who", "whom",
+            "without", "improve", "improving", "harm", "harming", "need", "using", "use",
+            "handle", "handling", "discuss", "implement", "designing", "describe", "explain",
+            "previous", "context", "please", "confirm", "walk", "approach",
+            "tell", "kind", "think", "seems",
         }
 
         # Extract core tech terms & capitalized acronyms (e.g. CAP, CQRS, Sagas, 2PC, API, Laravel, Redis)
-        raw_tech_tokens = re.findall(r'\b[A-Z0-9]{2,}\b|\b[a-zA-Z0-9_-]{4,}\b', english_text)
+        # Keywords describe the current utterance. Previous context may inform
+        # intent, but its transport labels must never become visible keywords.
+        raw_tech_tokens = re.findall(
+            r'\b[A-Z0-9]{2,}\b|\b[a-zA-Z0-9_-]{4,}\b', latest_text
+        )
         filtered_terms = []
         seen = set()
         for token in raw_tech_tokens:
@@ -94,104 +109,195 @@ class DynamicAIGenerator:
                 seen.add(t_lower)
                 filtered_terms.append(token)
 
-        # Top 5-6 Keywords
-        keywords_list = filtered_terms[:6] if filtered_terms else ["General Topic", "Conversation"]
+        technical_terms = {
+            "api", "architecture", "availability", "cache", "cluster", "concurrency",
+            "consistency", "database", "deadline", "dependency", "deployment",
+            "distributed", "event", "feature", "framework", "inference", "latency",
+            "memory", "microservice", "microservices", "model", "performance", "query",
+            "queue", "realtime", "replica", "rollback", "scalability", "security",
+            "sharding", "state", "storage", "testability", "testing", "throughput",
+            "token", "traffic", "transaction", "websocket", "graphql", "redis",
+            "kubernetes", "oauth2", "pkce", "cqrs", "saga", "argocd", "gitops",
+        }
+        ranked_terms = sorted(
+            enumerate(filtered_terms),
+            key=lambda entry: (
+                -(
+                    2
+                    if entry[1].isupper()
+                    else 1 if entry[1].lower() in technical_terms else 0
+                ),
+                entry[0],
+            ),
+        )
+        keywords_list = (
+            [term for _, term in ranked_terms[:6]]
+            if ranked_terms
+            else ["General Topic", "Conversation"]
+        )
         keywords_str = " ; ".join(keywords_list)
 
         # Detect core domain context dynamically
         domain_indicators = {
-            "cap theorem": "CAP Theorem & Distributed Consistency",
-            "distributed": "Distributed Systems & Scalability",
-            "financial": "Financial Transactions & Strict Consistency",
-            "cqrs": "CQRS & Event Sourcing Patterns",
-            "saga": "Saga Pattern & Distributed Transactions",
-            "2pc": "Two-Phase Commit (2PC) vs Sagas",
-            "cache": "Caching & In-Memory Storage",
-            "laravel": "Laravel Framework Architecture",
-            "feature": "Feature Flagging & Rollout Strategy",
-            "database": "Database Optimization & Sharding",
-            "microservice": "Microservices Architecture",
-            "api": "API High Concurrency Design"
+            "cap theorem": "định lý CAP và tính nhất quán của hệ phân tán",
+            "distributed": "hệ thống phân tán và khả năng mở rộng",
+            "financial": "giao dịch tài chính cần tính nhất quán nghiêm ngặt",
+            "cqrs": "CQRS và Event Sourcing",
+            "saga": "Saga và giao dịch phân tán",
+            "2pc": "sự đánh đổi giữa 2PC và Saga",
+            "cache": "bộ nhớ đệm và lưu trữ trong RAM",
+            "laravel": "kiến trúc ứng dụng Laravel",
+            "feature": "feature flag và chiến lược rollout",
+            "database": "tối ưu cơ sở dữ liệu và phân mảnh",
+            "microservice": "kiến trúc vi dịch vụ",
+            "api": "thiết kế API chịu tải cao",
+            "latency": "giảm độ trễ nhưng vẫn bảo toàn tính đúng đắn",
+            "oauth": "xác thực OAuth và an toàn token",
+            "kubernetes": "điều phối và tự động mở rộng Kubernetes",
+            "graphql": "GraphQL và tối ưu truy vấn",
         }
 
         matched_contexts = [desc for key, desc in domain_indicators.items() if key in text_clean]
         context_summary = ", ".join(matched_contexts) if matched_contexts else ", ".join(keywords_list[:2]) if keywords_list else "Câu chuyện chung"
 
         # Detect if input is a Question vs Statement/Opinion
-        words = text_clean.split()
+        words = latest_clean.split()
         first_two_words = words[:2] if len(words) >= 2 else words
-        is_question = "?" in english_text or any(w in first_two_words for w in ["how", "what", "why", "which", "can", "could", "would", "is", "are", "do", "does", "explain"])
+        is_question = "?" in latest_text or any(
+            word in first_two_words
+            for word in [
+                "how", "what", "why", "which", "can", "could", "would",
+                "is", "are", "do", "does", "explain",
+            ]
+        )
+        requests_response = bool(
+            re.search(
+                r"\b(please|let me know|can you|could you|would you|"
+                r"do you need|i need you|tell me|walk me through)\b",
+                latest_text.lower(),
+            )
+            or re.match(
+                r"^\s*(review|check|send|share|update|confirm|prepare|"
+                r"schedule|fix|investigate|provide|create)\b",
+                latest_text.lower(),
+            )
+        )
+        should_reply = is_question or requests_response
 
         # Stream 1b: Explanation
         if is_question:
             stream_1b = f"Hỏi về {context_summary}. Cần trả lời hoặc cung cấp thông tin phù hợp."
+        elif requests_response:
+            stream_1b = f"Đang đề nghị bạn thực hiện hoặc phản hồi về {context_summary}."
         else:
             stream_1b = f"Chia sẻ/cập nhật thông tin về: {context_summary}."
 
-        # Stream 2b EN: Dynamic Polished Response Construction
+        # Stream 2b: deterministic, safe responses for low-confidence local mode.
         primary_topic = keywords_list[0] if keywords_list else "the topic"
-        secondary_topics = ", ".join(keywords_list[1:4]) if len(keywords_list) > 1 else "the details"
 
-        if is_question:
-            if "cap" in text_clean or "financial" in text_clean or "saga" in text_clean:
+        if should_reply:
+            quick_en = "Sure. Let me think through that for a moment."
+            quick_vi = "(Được. Để tôi suy nghĩ kỹ một chút.)"
+            if "financial" in text_clean or "saga" in text_clean:
                 stream_2b_en = (
-                    f"For financial transactions requiring strict consistency under CAP theorem, I prioritize CP (Consistency/Partition Tolerance) for core ledger writes using Sagas or Event Sourcing. "
-                    f"I avoid 2PC due to blocking locks, separating read/write paths via CQRS to maintain high availability and handle write spikes."
+                    "For strict financial writes, I would prioritize consistency and partition tolerance, then use sagas for cross-service workflows. "
+                    "I would avoid broad 2PC locks and validate every trade-off against the ledger's recovery requirements."
                 )
                 stream_2b_vi = (
-                    f"(Đối với giao dịch tài chính yêu cầu nhất quán nghiêm ngặt theo định lý CAP, tôi ưu tiên tính nhất quán CP cho sổ cái dùng Saga hoặc Event Sourcing. "
-                    f"Tôi tránh dùng 2PC do khóa nghẽn, tách biệt đường đọc/ghi qua CQRS để duy trì tính sẵn sàng cao)."
+                    "(Với các thao tác ghi tài chính nghiêm ngặt, tôi ưu tiên tính nhất quán và khả năng chịu phân vùng, sau đó dùng saga cho quy trình liên dịch vụ. "
+                    "Tôi sẽ tránh khóa 2PC trên phạm vi rộng và kiểm chứng từng đánh đổi theo yêu cầu khôi phục của sổ cái.)"
+                )
+            elif any(
+                term in text_clean
+                for term in ("distributed", "consistency", "availability", "cap theorem")
+            ):
+                stream_2b_en = (
+                    "I would start by defining the required consistency and availability guarantees for each operation. "
+                    "Then I would design for partitions and retries explicitly, use idempotent operations, and test node, network, and dependency failures under load."
+                )
+                stream_2b_vi = (
+                    "(Tôi sẽ bắt đầu bằng cách xác định yêu cầu về tính nhất quán và tính sẵn sàng cho từng thao tác. "
+                    "Sau đó tôi sẽ thiết kế rõ cách xử lý phân vùng mạng và retry, dùng thao tác idempotent, đồng thời kiểm thử lỗi node, mạng và dịch vụ phụ thuộc dưới tải.)"
                 )
             elif "feature" in text_clean or "rollout" in text_clean:
                 stream_2b_en = (
-                    f"To implement feature-flagging for {primary_topic} with minimal tech debt, I leverage a dedicated Feature class backed by a Redis/Database store. "
-                    f"Configuration is injected via Service Providers rather than hardcoding in .env, enabling clean A/B testing and seamless rollbacks."
+                    "I would keep feature evaluation behind one typed service and store rollout rules outside application code. "
+                    "Then I would add ownership, expiry dates, metrics, and a tested rollback path for every flag."
                 )
                 stream_2b_vi = (
-                    f"(Để triển khai cờ tính năng cho {primary_topic} ít nợ công nghệ, tôi dùng Feature class với lưu trữ Redis/DB. "
-                    f"Cấu hình được tiêm qua Service Provider giúp dễ A/B testing và rollback an toàn)."
+                    "(Tôi sẽ đặt việc đánh giá feature flag sau một service có kiểu dữ liệu rõ ràng và lưu quy tắc rollout ngoài mã ứng dụng. "
+                    "Sau đó mỗi flag cần có người phụ trách, ngày hết hạn, số liệu theo dõi và đường rollback đã được kiểm thử.)"
+                )
+            elif "latency" in text_clean or "performance" in text_clean:
+                stream_2b_en = (
+                    "I would measure p95 and p99 latency first, then profile the request path to find the real bottleneck. "
+                    "I would optimize with targeted caching, batching, or concurrency while keeping authoritative writes strongly consistent and validating the result under load."
+                )
+                stream_2b_vi = (
+                    "(Trước tiên tôi sẽ đo độ trễ p95 và p99, sau đó phân tích toàn bộ đường đi của request để tìm đúng nút thắt. "
+                    "Tôi sẽ tối ưu có mục tiêu bằng cache, batching hoặc xử lý đồng thời, đồng thời giữ các thao tác ghi nguồn ở trạng thái nhất quán nghiêm ngặt và kiểm chứng dưới tải.)"
+                )
+            elif "database" in text_clean or "query" in text_clean:
+                stream_2b_en = (
+                    "I would start with the query plan and production metrics, then fix indexing, scan volume, and lock contention before considering sharding. "
+                    "Read replicas can absorb safe reads, but partitioning should follow measured access patterns and a tested migration plan."
+                )
+                stream_2b_vi = (
+                    "(Tôi sẽ bắt đầu từ kế hoạch thực thi truy vấn và số liệu production, sau đó xử lý index, lượng dữ liệu quét và tranh chấp khóa trước khi cân nhắc sharding. "
+                    "Read replica có thể gánh các lượt đọc an toàn, còn phân vùng phải dựa trên mẫu truy cập đã đo và kế hoạch migration được kiểm thử.)"
+                )
+            elif any(
+                term in text_clean
+                for term in ("oauth", "pkce", "token", "security", "xss", "csrf")
+            ):
+                stream_2b_en = (
+                    "I would use Authorization Code with PKCE, keep tokens out of persistent browser storage, and enforce short lifetimes and rotation. "
+                    "I would pair that with strict CSP, state and nonce validation, secure cookies where possible, and server-side authorization on every request."
+                )
+                stream_2b_vi = (
+                    "(Tôi sẽ dùng Authorization Code với PKCE, không lưu token lâu dài trong trình duyệt, đồng thời đặt thời hạn ngắn và cơ chế xoay vòng. "
+                    "Giải pháp cần đi kèm CSP nghiêm ngặt, kiểm tra state/nonce, cookie an toàn khi phù hợp và xác thực quyền ở server cho mọi request.)"
+                )
+            elif "kubernetes" in text_clean or "autoscaler" in text_clean:
+                stream_2b_en = (
+                    "I would scale pods from workload metrics and ensure the cluster autoscaler has enough headroom to add nodes before pods remain pending. "
+                    "I would also test stabilization windows, resource requests, disruption budgets, and the behavior during a sudden spike."
+                )
+                stream_2b_vi = (
+                    "(Tôi sẽ mở rộng pod dựa trên số liệu tải và bảo đảm cluster autoscaler còn đủ dư địa thêm node trước khi pod phải chờ. "
+                    "Tôi cũng sẽ kiểm thử cửa sổ ổn định, resource request, disruption budget và hành vi khi lưu lượng tăng đột ngột.)"
+                )
+            elif "microservice" in text_clean or "event-driven" in text_clean:
+                stream_2b_en = (
+                    "I would make consumers idempotent with a durable event identifier and commit business state together with the deduplication record. "
+                    "Retries need backoff and observability, while poison events should move to a dead-letter path with an explicit replay process."
+                )
+                stream_2b_vi = (
+                    "(Tôi sẽ thiết kế consumer có tính idempotent bằng mã sự kiện bền vững và ghi trạng thái nghiệp vụ cùng bản ghi chống trùng. "
+                    "Retry cần backoff và khả năng quan sát; sự kiện lỗi lặp lại phải chuyển sang dead-letter queue với quy trình replay rõ ràng.)"
                 )
             else:
-                q_responses = [
-                    ("That's a good question. Let me double check and get back to you.", "(Đó là một câu hỏi hay. Để tôi kiểm tra lại và báo lại bạn.)"),
-                    (f"It depends on the context of {primary_topic}, but I think so.", f"(Điều đó tùy thuộc vào bối cảnh của {primary_topic}, nhưng tôi nghĩ vậy.)"),
-                    ("I'm not entirely sure, could you clarify what you mean?", "(Tôi không chắc lắm, bạn có thể làm rõ ý của mình không?)"),
-                    ("Yes, that makes sense. We should verify the details though.", "(Vâng, có lý đấy. Tuy nhiên chúng ta nên xác minh lại chi tiết.)"),
-                    (f"Regarding {primary_topic}, I would need to look into it a bit more.", f"(Về vấn đề {primary_topic}, tôi sẽ cần xem xét thêm một chút.)")
-                ]
-                selected_resp = random.choice(q_responses)
-                stream_2b_en = selected_resp[0]
-                stream_2b_vi = selected_resp[1]
+                stream_2b_en = (
+                    f"For {primary_topic}, I would first confirm the goal, constraints, and expected failure behavior. "
+                    "Then I would compare the viable options, explain their trade-offs, and validate the choice with a small test."
+                )
+                stream_2b_vi = (
+                    f"(Với {primary_topic}, trước tiên tôi sẽ xác nhận mục tiêu, các ràng buộc và cách hệ thống cần xử lý khi lỗi. "
+                    "Sau đó tôi sẽ so sánh các phương án khả thi, giải thích các đánh đổi và kiểm chứng lựa chọn bằng một thử nghiệm nhỏ.)"
+                )
         else:
-            # Active Listening & Engagement Response for Statements / Updates
-            # Generate native-like short conversational fillers instead of robotic sentences
-            fillers = [
-                ("Got it.", "(Đã rõ.)"),
-                ("Makes sense.", "(Có lý.)"),
-                ("Oh, I see.", "(Ồ, tôi hiểu rồi.)"),
-                ("Right, exactly.", "(Đúng vậy, chính xác.)"),
-                ("Sounds good.", "(Nghe hay đấy.)"),
-                ("Yeah, for sure.", "(Vâng, chắc chắn rồi.)"),
-                ("Okay, cool.", "(Được thôi, tuyệt.)"),
-                ("Good to know.", "(Thông tin rất hữu ích.)"),
-                ("I agree.", "(Tôi đồng ý.)"),
-                ("Ah, okay.", "(À, ra vậy.)")
-            ]
-            
-            selected_filler = random.choice(fillers)
-            
-            if len(english_text.split()) > 7 and primary_topic != "the topic":
-                # Add a tiny bit of context if the sentence is long and has a specific topic
-                stream_2b_en = f"{selected_filler[0]} Thanks for the update on {primary_topic}."
-                stream_2b_vi = f"{selected_filler[1]} (Cảm ơn bạn đã cập nhật về {primary_topic}.)"
-            else:
-                stream_2b_en = selected_filler[0]
-                stream_2b_vi = selected_filler[1]
+            quick_en = ""
+            quick_vi = "Không cần phản hồi ngay — tiếp tục lắng nghe."
+            stream_2b_en = ""
+            stream_2b_vi = ""
 
 
         return {
             "stream_1b": stream_1b,
             "stream_2a": keywords_str,
+            "stream_2b_quick_en": quick_en,
+            "stream_2b_quick_vi": quick_vi,
             "stream_2b_en": stream_2b_en,
-            "stream_2b_vi": stream_2b_vi
+            "stream_2b_vi": stream_2b_vi,
+            "stream_2b_should_reply": should_reply,
         }

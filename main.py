@@ -3,12 +3,21 @@ Main Entry Point for English Call Assistant & Dual-Stream Overlay Window
 """
 import sys
 import os
-import threading
-import time
+from datetime import datetime
+from pathlib import Path
+from itertools import count
+
+# Never inherit the headless Qt backend when launching the real Windows app.
+if sys.platform == "win32" and os.getenv("QT_QPA_PLATFORM") == "offscreen":
+    os.environ.pop("QT_QPA_PLATFORM", None)
 
 # IMPORT CORE ENGINES FIRST TO PREVENT PYSIDE6 SHIBOKEN IMPORT BUGS WITH VOSK/REQUESTS
 from config import Config
 from core.audio_capturer import AudioCapturer
+from core.conversation_context import ConversationContext
+from core.latest_task_pool import LatestTaskPool
+from core.session_recorder import SessionRecorder
+from core.session_transcript import SessionTranscript
 from core.translator_engine import TranslatorEngine
 from core.smart_reply_engine import SmartReplyEngine
 from core.stt_engine import STTEngine
@@ -16,9 +25,11 @@ import ctypes
 from utils.logger import logger
 
 # THEN IMPORT PYSIDE6
-from PySide6.QtWidgets import QApplication, QPushButton, QHBoxLayout
-from PySide6.QtCore import Qt, QLockFile, QDir
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PySide6.QtCore import QLockFile, QDir, QTimer, QUrl
 from PySide6.QtGui import QIcon
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 
 from gui.overlay_window import OverlayWindow
 
@@ -30,12 +41,15 @@ if sys.platform == "win32":
         pass
 
 class AppController:
+    ACTIVATION_SERVER_NAME = "english_call_assistant_activation"
+
     def __init__(self):
         # Single Instance Lock Enforcement (Prevent multiple app instances)
         self.lock_file = QLockFile(os.path.join(QDir.tempPath(), "english_call_assistant.lock"))
         if not self.lock_file.tryLock(100):
             self.lock_file.removeStaleLockFile()
             if not self.lock_file.tryLock(100):
+                self._request_existing_activation()
                 logger.warning("Another instance of English Call Assistant is already running. Exiting.")
                 sys.exit(0)
 
@@ -50,6 +64,30 @@ class AppController:
 
         self.app.setQuitOnLastWindowClosed(True)
         self.overlay = OverlayWindow()
+        self._setup_activation_server()
+        self._utterance_ids = count(1)
+        self._conversation_context = ConversationContext()
+        self._task_pool = LatestTaskPool(max_workers=4)
+        self._recorder = SessionRecorder()
+        self._session_transcript = SessionTranscript()
+        self._replay_active = False
+        self._replay_started = False
+        self._shutdown_started = False
+        self.app.aboutToQuit.connect(self._shutdown)
+
+        self._replay_audio_output = QAudioOutput(self.app)
+        self._replay_player = QMediaPlayer(self.app)
+        self._replay_player.setAudioOutput(self._replay_audio_output)
+        self._replay_player.playbackStateChanged.connect(
+            self._on_replay_state_changed
+        )
+        self._replay_player.errorOccurred.connect(self._on_replay_error)
+
+        self.overlay.signal_recording_toggled.connect(
+            self._handle_recording_toggled
+        )
+        self.overlay.signal_replay_requested.connect(self._replay_latest)
+        self.overlay.signal_export_requested.connect(self._export_session)
 
 
         # Initialize Core Engines
@@ -60,8 +98,42 @@ class AppController:
             callback_on_speech=self.on_audio_received,
             stt_engine=self.stt_engine,
             callback_audio_activity=self.on_audio_activity_event,
-            callback_partial_speech=self.on_partial_audio_received
+            callback_partial_speech=self.on_partial_audio_received,
+            callback_recording_audio=self._recorder.append,
         )
+
+    @classmethod
+    def _request_existing_activation(cls):
+        socket = QLocalSocket()
+        socket.connectToServer(cls.ACTIVATION_SERVER_NAME)
+        if socket.waitForConnected(500):
+            socket.write(b"activate")
+            socket.waitForBytesWritten(500)
+            socket.disconnectFromServer()
+
+    def _setup_activation_server(self):
+        QLocalServer.removeServer(self.ACTIVATION_SERVER_NAME)
+        self.activation_server = QLocalServer(self.app)
+        if not self.activation_server.listen(self.ACTIVATION_SERVER_NAME):
+            logger.warning(
+                f"Could not start activation server: "
+                f"{self.activation_server.errorString()}"
+            )
+            return
+        self.activation_server.newConnection.connect(
+            self._activate_from_secondary_instance
+        )
+
+    def _activate_from_secondary_instance(self):
+        while self.activation_server.hasPendingConnections():
+            connection = self.activation_server.nextPendingConnection()
+            connection.disconnectFromServer()
+        if self.overlay.isMinimized():
+            self.overlay.showNormal()
+        self.overlay.show()
+        self.overlay.raise_()
+        self.overlay.activateWindow()
+        logger.info("Existing app window activated by a second launch request.")
 
     def on_audio_activity_event(self, is_capturing: bool, volume: float):
         """Emits thread-safe signal to update visual audio indicator on top bar."""
@@ -76,49 +148,203 @@ class AppController:
 
     def process_incoming_speech(self, english_text: str):
         """
-        Processes incoming English audio through all 4 streams in parallel threads.
+        Processes incoming English through bounded latest-result worker streams.
         """
         logger.info(f"Processing Incoming English Speech: '{english_text}'")
+        utterance_id = next(self._utterance_ids)
+        self._session_transcript.record_english(utterance_id, english_text)
+        translation_context = self._conversation_context.add(english_text)
+        previous_context = translation_context[:-1]
+        analysis_context = english_text
+        if previous_context:
+            analysis_context += "\nPrevious context: " + " ".join(previous_context)
 
         # --- LUỒNG 1A: Dịch Realtime (Live Subtitle - Instant 0ms English Display) ---
         # 1. Emit English transcript IMMEDIATELY (0ms delay)
-        self.overlay.signal_stream1a.emit(english_text, "Đang dịch...")
+        self.overlay.signal_stream1a.emit(utterance_id, english_text, "Đang dịch...")
+        # Keep the contextual English view local and immediate. It must not wait
+        # for the slower contextual Vietnamese translation/network path.
+        self.overlay.signal_contextual_english.emit(
+            utterance_id, " ".join(translation_context)
+        )
 
-        def run_stream_1a():
-            # 2. Fetch Vietnamese translation asynchronously and update line
-            vi_trans = self.translator.translate_en_to_vi(english_text)
+        def publish_translation(vi_trans: str):
+            self._session_transcript.record_translation(utterance_id, vi_trans)
             logger.info(f"[STREAM 1A] EN: '{english_text}' -> VI: '{vi_trans}'")
-            self.overlay.signal_stream1a.emit(english_text, vi_trans)
+            self.overlay.signal_stream1a.emit(utterance_id, english_text, vi_trans)
 
+        self._task_pool.submit_latest(
+            "translation",
+            utterance_id,
+            lambda: self.translator.translate_en_to_vi(english_text),
+            publish_translation,
+        )
 
-        # --- LUỒNG 1B: Giải thích Ý nghĩa Tiếng Việt ---
-        def run_stream_1b():
-            vi_explanation = self.translator.explain_context_vi(english_text)
+        if len(translation_context) >= 2:
+            combined_english = " ".join(translation_context)
+
+            def publish_contextual_translation(contextual_vi: str):
+                self._session_transcript.record_contextual_translation(
+                    utterance_id, contextual_vi
+                )
+                logger.info(
+                    f"[STREAM 1A CONTEXT] EN: '{combined_english}' "
+                    f"-> VI: '{contextual_vi}'"
+                )
+                self.overlay.signal_stream1a_context.emit(
+                    utterance_id,
+                    combined_english,
+                    contextual_vi,
+                )
+
+            self._task_pool.submit_latest(
+                "contextual_translation",
+                utterance_id,
+                lambda: self.translator.translate_contextual_en_to_vi(
+                    translation_context
+                ),
+                publish_contextual_translation,
+            )
+
+        def prepare_assistance() -> dict:
+            bundle = self.smart_reply.generate_stream_bundle(analysis_context)
+            fast_bilingual = self.translator.format_bilingual_keywords(
+                bundle["keywords"], allow_network=False
+            )
+            bundle["keywords"] = fast_bilingual
+            return bundle
+
+        def publish_assistance(bundle: dict):
+            self._session_transcript.record_assistance(utterance_id, bundle)
+            vi_explanation = bundle["explanation"]
             logger.info(f"[STREAM 1B] Context: '{vi_explanation}'")
-            self.overlay.signal_stream1b.emit(vi_explanation)
+            self.overlay.signal_stream1b.emit(utterance_id, vi_explanation)
+            fast_bilingual = bundle["keywords"]
+            logger.info(f"[STREAM 2A] Keywords: '{fast_bilingual}'")
+            self.overlay.signal_stream2a.emit(utterance_id, fast_bilingual)
+            logger.info(
+                f"[STREAM 2B] Reply EN: '{bundle['english']}' | "
+                f"Reply VI: '{bundle['vietnamese']}'"
+            )
+            self.overlay.signal_stream2b.emit(
+                utterance_id,
+                bundle["quick_english"],
+                bundle["quick_vietnamese"],
+                bundle["english"],
+                bundle["vietnamese"],
+                bundle["should_reply"],
+            )
 
-        # --- LUỒNG 2A: Từ khóa siêu tốc (< 150ms) ---
-        def run_stream_2a():
-            keywords = self.smart_reply.generate_stream_2a_keywords(english_text)
-            logger.info(f"[STREAM 2A] Keywords: '{keywords}'")
-            self.overlay.signal_stream2a.emit(keywords)
-
-        # --- LUỒNG 2B: Câu trả lời Tiếng Anh chuẩn mực (< 400ms) ---
-        def run_stream_2b():
-            response_dict = self.smart_reply.generate_stream_2b_response(english_text)
-            logger.info(f"[STREAM 2B] Reply EN: '{response_dict['english']}' | Reply VI: '{response_dict['vietnamese']}'")
-            self.overlay.signal_stream2b.emit(response_dict["english"], response_dict["vietnamese"])
-
-        # Execute parallel workers for minimal latency
-        threading.Thread(target=run_stream_1a, daemon=True).start()
-        threading.Thread(target=run_stream_1b, daemon=True).start()
-        threading.Thread(target=run_stream_2a, daemon=True).start()
-        threading.Thread(target=run_stream_2b, daemon=True).start()
+        self._task_pool.submit_latest(
+            "assistance",
+            utterance_id,
+            prepare_assistance,
+            publish_assistance,
+        )
 
     def on_audio_received(self, channel_type: str, text_payload: str, raw_bytes: bytes = None):
         """Callback triggered when audio/speech is captured or injected."""
         if channel_type == "incoming":
             self.process_incoming_speech(text_payload)
+
+    def _handle_recording_toggled(self, enabled: bool):
+        try:
+            if enabled:
+                self._recorder.start()
+                self.overlay.set_recording_state(True)
+                return
+            saved_path = self._recorder.stop()
+            latest = saved_path or self._recorder.last_recording_path
+            self.overlay.set_recording_state(False, str(latest or ""))
+        except Exception as error:
+            logger.exception(f"Could not change recording state: {error}")
+            self.overlay.set_recording_state(
+                self._recorder.is_recording,
+                str(self._recorder.last_recording_path or ""),
+            )
+            QMessageBox.warning(
+                self.overlay, "Recording error", f"Could not record audio:\n{error}"
+            )
+
+    def _replay_latest(self):
+        recording_path = self._recorder.last_recording_path
+        if not recording_path or not recording_path.exists():
+            self.overlay.set_recording_state(False)
+            QMessageBox.information(
+                self.overlay, "Replay", "No completed recording is available yet."
+            )
+            return
+        self._replay_started = False
+        self._replay_active = True
+        self.audio_capturer.set_processing_enabled(False)
+        self.overlay.set_replay_state(True)
+        self._replay_player.setSource(QUrl.fromLocalFile(str(recording_path)))
+        self._replay_player.play()
+        QTimer.singleShot(3000, self._verify_replay_started)
+        logger.info(f"Replaying session recording: {recording_path}")
+
+    def _verify_replay_started(self):
+        if self._replay_active and not self._replay_started:
+            logger.warning("Replay did not start within three seconds.")
+            self._finish_replay()
+            QMessageBox.warning(
+                self.overlay,
+                "Replay error",
+                "Audio playback did not start. Check the Windows output device.",
+            )
+
+    def _on_replay_state_changed(self, state):
+        if not self._replay_active:
+            return
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self._replay_started = True
+        elif (
+            state == QMediaPlayer.PlaybackState.StoppedState
+            and self._replay_started
+        ):
+            self._finish_replay()
+
+    def _on_replay_error(self, error, error_string: str):
+        if not self._replay_active:
+            return
+        logger.warning(f"Replay failed ({error}): {error_string}")
+        self._finish_replay()
+        QMessageBox.warning(
+            self.overlay, "Replay error", error_string or "Could not replay audio."
+        )
+
+    def _finish_replay(self):
+        self._replay_active = False
+        self._replay_started = False
+        self.audio_capturer.set_processing_enabled(True)
+        self.overlay.set_replay_state(False)
+        self.overlay.set_recording_state(
+            False, str(self._recorder.last_recording_path or "")
+        )
+
+    def _export_session(self):
+        export_dir = Path.home() / "Documents" / "Translator" / "Exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        suggested = export_dir / f"session_{datetime.now():%Y%m%d_%H%M%S}.txt"
+        selected, _ = QFileDialog.getSaveFileName(
+            self.overlay,
+            "Export complete session",
+            str(suggested),
+            "Text files (*.txt)",
+        )
+        if not selected:
+            return
+        try:
+            output_path = self._session_transcript.export(
+                selected, self._recorder.last_recording_path
+            )
+            logger.info(f"Session transcript exported: {output_path}")
+            self.overlay.btn_export.setToolTip(f"Last export\n{output_path}")
+        except Exception as error:
+            logger.exception(f"Could not export session transcript: {error}")
+            QMessageBox.warning(
+                self.overlay, "Export error", f"Could not export session:\n{error}"
+            )
 
     def run(self):
         self.overlay.show()
@@ -129,8 +355,17 @@ class AppController:
 
         sys.exit(self.app.exec())
 
+    def _shutdown(self):
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
+        if self._replay_active:
+            self._replay_player.stop()
+        self._recorder.close()
+        self.audio_capturer.stop_capture()
+        self._task_pool.shutdown()
+
 
 if __name__ == "__main__":
     controller = AppController()
     controller.run()
-

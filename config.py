@@ -30,8 +30,8 @@ class Config:
     # --- UI Settings ---
     WINDOW_ALWAYS_ON_TOP = True
     WINDOW_OPACITY = 0.92  # Glass opacity (0.5 to 1.0)
-    WINDOW_WIDTH = 520
-    WINDOW_HEIGHT = 450
+    WINDOW_WIDTH = 840
+    WINDOW_HEIGHT = 620
     FONT_FAMILY = "Segoe UI"
     FONT_SIZE_SUBTITLE = 13
     FONT_SIZE_EXPLANATION = 12

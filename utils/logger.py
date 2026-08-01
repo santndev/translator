@@ -2,6 +2,17 @@ import logging
 import sys
 import os
 
+
+def _configure_utf8_stream(stream):
+    """Make redirected Windows console streams safe for Vietnamese text."""
+    reconfigure = getattr(stream, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (OSError, ValueError):
+            pass
+    return stream
+
 def setup_logger(name="AppLogger"):
     logger = logging.getLogger(name)
     if not logger.handlers:
@@ -9,6 +20,8 @@ def setup_logger(name="AppLogger"):
         formatter = logging.Formatter("[%(asctime)s] [%(levelname)s]: %(message)s", datefmt="%H:%M:%S")
         
         # Console Handler
+        _configure_utf8_stream(sys.stdout)
+        _configure_utf8_stream(sys.stderr)
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
