@@ -1,0 +1,156 @@
+"""
+Main Entry Point for English Call Assistant & Dual-Stream Overlay Window
+"""
+import sys
+import os
+import threading
+import time
+from PySide6.QtWidgets import QApplication, QPushButton, QHBoxLayout
+from PySide6.QtCore import Qt
+
+from config import Config
+from gui.overlay_window import OverlayWindow
+from core.audio_capturer import AudioCapturer
+from core.translator_engine import TranslatorEngine
+from core.smart_reply_engine import SmartReplyEngine
+from tests.mock_audio_generator import MockAudioGenerator
+from utils.logger import logger
+
+from core.stt_engine import STTEngine
+
+from PySide6.QtCore import QLockFile, QDir
+
+class AppController:
+    def __init__(self):
+        # Single Instance Lock Enforcement (Prevent multiple app instances)
+        self.lock_file = QLockFile(os.path.join(QDir.tempPath(), "english_call_assistant.lock"))
+        if not self.lock_file.tryLock(100):
+            logger.warning("Another instance of English Call Assistant is already running. Exiting.")
+            sys.exit(0)
+
+
+        self.app = QApplication(sys.argv)
+        self.app.setApplicationName("English Call Assistant")
+        self.app.setQuitOnLastWindowClosed(True)
+        self.overlay = OverlayWindow()
+
+
+        # Initialize Core Engines
+        self.stt_engine = STTEngine(model_size="tiny.en")
+        self.translator = TranslatorEngine()
+        self.smart_reply = SmartReplyEngine()
+        self.audio_capturer = AudioCapturer(
+            callback_on_speech=self.on_audio_received,
+            stt_engine=self.stt_engine,
+            callback_audio_activity=self.on_audio_activity_event,
+            callback_partial_speech=self.on_partial_audio_received
+        )
+
+        self.setup_mock_test_button()
+
+    def on_audio_activity_event(self, is_capturing: bool, volume: float):
+        """Emits thread-safe signal to update visual audio indicator on top bar."""
+        self.overlay.signal_audio_activity.emit(is_capturing, volume)
+
+    def on_partial_audio_received(self, channel_type: str, partial_text: str):
+        """Luồng 1c: Independent live word-by-word streaming display."""
+        if channel_type == "incoming" and partial_text and partial_text.strip():
+            self.overlay.signal_stream1c.emit(partial_text.strip())
+
+
+
+
+
+
+    def setup_mock_test_button(self):
+        """Adds a 1-Click Mock Test Button to header bar for instant testing."""
+        self.btn_test = QPushButton("🧪 Run Mock Call Test", self.overlay)
+        self.btn_test.setCursor(Qt.PointingHandCursor)
+        self.btn_test.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(124, 58, 237, 0.85);
+                color: #FFFFFF;
+                border: 1px solid rgba(139, 92, 246, 0.4);
+                border-radius: 6px;
+                padding: 3px 9px;
+                font-size: 10px;
+                font-weight: 700;
+            }
+            QPushButton:hover {
+                background-color: rgba(139, 92, 246, 0.95);
+            }
+            QPushButton:pressed {
+                background-color: #6D28D9;
+            }
+        """)
+        self.btn_test.clicked.connect(self.run_mock_call_simulation)
+        
+        # Insert into header layout
+        central_layout = self.overlay.central_widget.layout()
+        header_layout = central_layout.itemAt(0).layout()
+        header_layout.insertWidget(1, self.btn_test)
+
+    def process_incoming_speech(self, english_text: str):
+        """
+        Processes incoming English audio through all 4 streams in parallel threads.
+        """
+        logger.info(f"Processing Incoming English Speech: '{english_text}'")
+
+        # --- LUỒNG 1A: Dịch Realtime (Live Subtitle - Instant 0ms English Display) ---
+        # 1. Emit English transcript IMMEDIATELY (0ms delay)
+        self.overlay.signal_stream1a.emit(english_text, "Đang dịch...")
+
+        def run_stream_1a():
+            # 2. Fetch Vietnamese translation asynchronously and update line
+            vi_trans = self.translator.translate_en_to_vi(english_text)
+            self.overlay.signal_stream1a.emit(english_text, vi_trans)
+
+
+        # --- LUỒNG 1B: Giải thích Ý nghĩa Tiếng Việt ---
+        def run_stream_1b():
+            vi_explanation = self.translator.explain_context_vi(english_text)
+            self.overlay.signal_stream1b.emit(vi_explanation)
+
+        # --- LUỒNG 2A: Từ khóa siêu tốc (< 150ms) ---
+        def run_stream_2a():
+            keywords = self.smart_reply.generate_stream_2a_keywords(english_text)
+            self.overlay.signal_stream2a.emit(keywords)
+
+        # --- LUỒNG 2B: Câu trả lời Tiếng Anh chuẩn mực (< 400ms) ---
+        def run_stream_2b():
+            response_dict = self.smart_reply.generate_stream_2b_response(english_text)
+            self.overlay.signal_stream2b.emit(response_dict["english"], response_dict["vietnamese"])
+
+        # Execute parallel workers for minimal latency
+        threading.Thread(target=run_stream_1a, daemon=True).start()
+        threading.Thread(target=run_stream_1b, daemon=True).start()
+        threading.Thread(target=run_stream_2a, daemon=True).start()
+        threading.Thread(target=run_stream_2b, daemon=True).start()
+
+    def on_audio_received(self, channel_type: str, text_payload: str, raw_bytes: bytes = None):
+        """Callback triggered when audio/speech is captured or injected."""
+        if channel_type == "incoming":
+            self.process_incoming_speech(text_payload)
+
+    def run_mock_call_simulation(self):
+        """Simulates 2 English audio streams for instant testing on UI."""
+        logger.info("Running 2-Channel Mock Audio Call Simulation...")
+        mock_spk = MockAudioGenerator.get_mock_speaker_audio()
+        
+        # Inject Speaker Audio (Other person asking technical question)
+        self.audio_capturer.inject_mock_audio(mock_spk["channel"], mock_spk["english_text"])
+
+    def run(self):
+        self.overlay.show()
+        self.overlay.raise_()
+        self.overlay.activateWindow()
+        self.audio_capturer.start_capture()
+        logger.info("English Call Assistant is running in LIVE capture mode. Overlay window displayed.")
+
+        sys.exit(self.app.exec())
+
+
+if __name__ == "__main__":
+    controller = AppController()
+    controller.run()
+
