@@ -34,8 +34,10 @@ class AppController:
         # Single Instance Lock Enforcement (Prevent multiple app instances)
         self.lock_file = QLockFile(os.path.join(QDir.tempPath(), "english_call_assistant.lock"))
         if not self.lock_file.tryLock(100):
-            logger.warning("Another instance of English Call Assistant is already running. Exiting.")
-            sys.exit(0)
+            self.lock_file.removeStaleLockFile()
+            if not self.lock_file.tryLock(100):
+                logger.warning("Another instance of English Call Assistant is already running. Exiting.")
+                sys.exit(0)
 
         self.app = QApplication(sys.argv)
         self.app.setApplicationName("English Call Assistant")
