@@ -6,6 +6,9 @@ Uses PyAudioPatch on Windows for native loopback audio stream recording.
 import time
 import threading
 import numpy as np
+import json
+import os
+import vosk
 from utils.logger import logger
 
 class AudioCapturer:
@@ -22,6 +25,20 @@ class AudioCapturer:
         self.is_running = False
         self._threads = []
         self.pyaudio_instance = None
+        
+        # Initialize Vosk Model for Zero-Latency Stream 1c
+        vosk.SetLogLevel(-1) # Disable verbose logs
+        model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'models', 'vosk-model-small-en-us-0.15'))
+        try:
+            if os.path.exists(model_path):
+                self.vosk_model = vosk.Model(model_path)
+                logger.info("Vosk streaming STT model loaded successfully.")
+            else:
+                self.vosk_model = None
+                logger.warning(f"Vosk model not found at {model_path}.")
+        except Exception as e:
+            logger.warning(f"Could not load Vosk model: {e}")
+            self.vosk_model = None
 
     def _process_partial_captured_audio(self, channel_type: str, pcm_bytes: bytes, sample_rate: int):
         """Transcribes partial PCM audio for live word-by-word streaming."""
@@ -87,6 +104,9 @@ class AudioCapturer:
             silence_counter = 0
             speaking = False
             threshold = 350  # VAD energy threshold for speech detection
+            
+            # Initialize Vosk Recognizer at 16000Hz
+            vosk_recognizer = vosk.KaldiRecognizer(self.vosk_model, 16000) if getattr(self, 'vosk_model', None) else None
 
             logger.info("WASAPI Loopback Audio Listener ACTIVE. Play any YouTube video to capture!")
 
@@ -100,6 +120,30 @@ class AudioCapturer:
                     audio_np = np.frombuffer(data, dtype=np.int16)
                     energy = float(np.abs(audio_np).mean()) if len(audio_np) > 0 else 0.0
 
+                    # Zero-Latency Stream 1c using Vosk
+                    is_phrase_boundary = False
+                    if vosk_recognizer and self.callback_partial_speech:
+                        # Convert to 16kHz mono
+                        if channels > 1:
+                            audio_mono = audio_np.reshape(-1, channels).mean(axis=1).astype(np.int16)
+                        else:
+                            audio_mono = audio_np
+                        
+                        step = max(1, int(round(sample_rate / 16000.0)))
+                        audio_16k_bytes = audio_mono[::step].tobytes()
+                        
+                        is_phrase_boundary = vosk_recognizer.AcceptWaveform(audio_16k_bytes)
+                        if is_phrase_boundary:
+                            res = json.loads(vosk_recognizer.Result())
+                            final_text = res.get("text", "").strip()
+                            if final_text:
+                                self.callback_partial_speech("incoming", final_text)
+                        else:
+                            partial = json.loads(vosk_recognizer.PartialResult())
+                            partial_str = partial.get("partial", "").strip()
+                            if partial_str:
+                                self.callback_partial_speech("incoming", partial_str)
+
                     if energy > threshold:
                         audio_buffer.extend(data)
                         speaking = True
@@ -108,17 +152,6 @@ class AudioCapturer:
                         # Emit instant visual audio activity signal
                         if self.callback_audio_activity:
                             self.callback_audio_activity(True, energy)
-
-                        # Trigger Stream 1c live word stream every ~150ms of audio accumulation
-                        if self.callback_partial_speech and len(audio_buffer) >= sample_rate * 0.2 * 2 and len(audio_buffer) % 2048 < 1024:
-                            buf_copy = bytes(audio_buffer)
-                            threading.Thread(
-                                target=self._process_partial_captured_audio,
-                                args=("incoming", buf_copy, sample_rate),
-                                daemon=True
-                            ).start()
-
-
                     else:
                         if speaking:
                             silence_counter += 1
@@ -127,25 +160,32 @@ class AudioCapturer:
                             # Emit active signal while buffering end of phrase
                             if self.callback_audio_activity:
                                 self.callback_audio_activity(True, energy)
+                                
+                    # Trigger Faster-Whisper when Vosk detects a semantic boundary OR fallback silence
+                    if (is_phrase_boundary and speaking) or (speaking and silence_counter > 5):
+                        pcm_bytes = bytes(audio_buffer)
+                        audio_buffer = bytearray()
+                        speaking = False
+                        silence_counter = 0
+                        
+                        # Emit empty string to tell UnderstandingWidget to push current phrase to rolling buffer
+                        if self.callback_partial_speech:
+                            self.callback_partial_speech("incoming", "")
+                            
+                        # If Vosk didn't trigger this naturally (fallback timeout), forcefully reset it
+                        if not is_phrase_boundary and vosk_recognizer:
+                            vosk_recognizer.Reset()
 
-                            # 5 silence frames (~100ms) mark fast phrase boundary!
-                            if silence_counter > 5:
-                                pcm_bytes = bytes(audio_buffer)
-                                audio_buffer = bytearray()
-                                speaking = False
-                                silence_counter = 0
+                        if self.callback_audio_activity:
+                            self.callback_audio_activity(False, 0.0)
 
-                                if self.callback_audio_activity:
-                                    self.callback_audio_activity(False, 0.0)
+                        # Transcribe full accurate speech phrase
+                        if len(pcm_bytes) > sample_rate * 0.3 * 2:  # Min 0.3s speech
+                            self._process_captured_audio("incoming", pcm_bytes, sample_rate)
 
-                                # Transcribe full accurate speech phrase
-                                if len(pcm_bytes) > sample_rate * 0.3 * 2:  # Min 0.3s speech
-                                    self._process_captured_audio("incoming", pcm_bytes, sample_rate)
-
-
-                        else:
-                            if self.callback_audio_activity and time.time() % 0.5 < 0.1:
-                                self.callback_audio_activity(False, 0.0)
+                    elif not speaking:
+                        if self.callback_audio_activity and time.time() % 0.5 < 0.1:
+                            self.callback_audio_activity(False, 0.0)
 
                 except Exception as e:
                     time.sleep(0.01)

@@ -7,6 +7,7 @@ import re
 import time
 import urllib.request
 import json
+import random
 from config import Config
 from utils.logger import logger
 
@@ -93,8 +94,8 @@ class DynamicAIGenerator:
                 seen.add(t_lower)
                 filtered_terms.append(token)
 
-        # Top 5-6 Tech Keywords for Stream 2a
-        keywords_list = filtered_terms[:6] if filtered_terms else ["Architecture", "System Design", "Scalability", "Trade-offs"]
+        # Top 5-6 Keywords
+        keywords_list = filtered_terms[:6] if filtered_terms else ["General Topic", "Conversation"]
         keywords_str = " ; ".join(keywords_list)
 
         # Detect core domain context dynamically
@@ -114,20 +115,22 @@ class DynamicAIGenerator:
         }
 
         matched_contexts = [desc for key, desc in domain_indicators.items() if key in text_clean]
-        context_summary = ", ".join(matched_contexts) if matched_contexts else "Kiến trúc hệ thống & Kỹ thuật lập trình"
+        context_summary = ", ".join(matched_contexts) if matched_contexts else ", ".join(keywords_list[:2]) if keywords_list else "Câu chuyện chung"
 
         # Detect if input is a Question vs Statement/Opinion
-        is_question = "?" in english_text or any(w in text_clean.split()[:4] for w in ["how", "what", "why", "which", "can", "could", "would", "is", "are", "do", "does", "explain"])
+        words = text_clean.split()
+        first_two_words = words[:2] if len(words) >= 2 else words
+        is_question = "?" in english_text or any(w in first_two_words for w in ["how", "what", "why", "which", "can", "could", "would", "is", "are", "do", "does", "explain"])
 
         # Stream 1b: Explanation
         if is_question:
-            stream_1b = f"Hỏi về {context_summary}. Cần phân tích giải pháp kỹ thuật và các đánh đổi phù hợp."
+            stream_1b = f"Hỏi về {context_summary}. Cần trả lời hoặc cung cấp thông tin phù hợp."
         else:
-            stream_1b = f"Đối phương vừa chia sẻ ý kiến/cập nhật về: {context_summary}."
+            stream_1b = f"Chia sẻ/cập nhật thông tin về: {context_summary}."
 
         # Stream 2b EN: Dynamic Polished Response Construction
-        primary_topic = keywords_list[0] if keywords_list else "the system design"
-        secondary_topics = ", ".join(keywords_list[1:4]) if len(keywords_list) > 1 else "scalability and availability"
+        primary_topic = keywords_list[0] if keywords_list else "the topic"
+        secondary_topics = ", ".join(keywords_list[1:4]) if len(keywords_list) > 1 else "the details"
 
         if is_question:
             if "cap" in text_clean or "financial" in text_clean or "saga" in text_clean:
@@ -149,24 +152,41 @@ class DynamicAIGenerator:
                     f"Cấu hình được tiêm qua Service Provider giúp dễ A/B testing và rollback an toàn)."
                 )
             else:
-                stream_2b_en = (
-                    f"Regarding {primary_topic}, the optimal approach balances {secondary_topics} by establishing clear boundary contexts, "
-                    f"leveraging asynchronous processing, and evaluating trade-offs between consistency and latency."
-                )
-                stream_2b_vi = (
-                    f"(Về vấn đề {primary_topic}, giải pháp tối ưu là cân bằng giữa {secondary_topics} bằng ranh giới rõ ràng, "
-                    f"tận dụng xử lý bất đồng bộ và đánh giá sự đánh đổi giữa tính nhất quán và độ trễ)."
-                )
+                q_responses = [
+                    ("That's a good question. Let me double check and get back to you.", "(Đó là một câu hỏi hay. Để tôi kiểm tra lại và báo lại bạn.)"),
+                    (f"It depends on the context of {primary_topic}, but I think so.", f"(Điều đó tùy thuộc vào bối cảnh của {primary_topic}, nhưng tôi nghĩ vậy.)"),
+                    ("I'm not entirely sure, could you clarify what you mean?", "(Tôi không chắc lắm, bạn có thể làm rõ ý của mình không?)"),
+                    ("Yes, that makes sense. We should verify the details though.", "(Vâng, có lý đấy. Tuy nhiên chúng ta nên xác minh lại chi tiết.)"),
+                    (f"Regarding {primary_topic}, I would need to look into it a bit more.", f"(Về vấn đề {primary_topic}, tôi sẽ cần xem xét thêm một chút.)")
+                ]
+                selected_resp = random.choice(q_responses)
+                stream_2b_en = selected_resp[0]
+                stream_2b_vi = selected_resp[1]
         else:
             # Active Listening & Engagement Response for Statements / Updates
-            stream_2b_en = (
-                f"That is a great update regarding {primary_topic}! I completely agree with your approach on {secondary_topics}, "
-                f"and continuing to monitor key metrics will ensure long-term stability."
-            )
-            stream_2b_vi = (
-                f"(Đó là một chia sẻ rất hay về {primary_topic}! Tôi hoàn toàn đồng ý với góc nhìn của bạn về {secondary_topics}, "
-                f"và việc tiếp tục theo dõi các chỉ số chính sẽ đảm bảo sự ổn định lâu dài)."
-            )
+            # Generate native-like short conversational fillers instead of robotic sentences
+            fillers = [
+                ("Got it.", "(Đã rõ.)"),
+                ("Makes sense.", "(Có lý.)"),
+                ("Oh, I see.", "(Ồ, tôi hiểu rồi.)"),
+                ("Right, exactly.", "(Đúng vậy, chính xác.)"),
+                ("Sounds good.", "(Nghe hay đấy.)"),
+                ("Yeah, for sure.", "(Vâng, chắc chắn rồi.)"),
+                ("Okay, cool.", "(Được thôi, tuyệt.)"),
+                ("Good to know.", "(Thông tin rất hữu ích.)"),
+                ("I agree.", "(Tôi đồng ý.)"),
+                ("Ah, okay.", "(À, ra vậy.)")
+            ]
+            
+            selected_filler = random.choice(fillers)
+            
+            if len(english_text.split()) > 7 and primary_topic != "the topic":
+                # Add a tiny bit of context if the sentence is long and has a specific topic
+                stream_2b_en = f"{selected_filler[0]} Thanks for the update on {primary_topic}."
+                stream_2b_vi = f"{selected_filler[1]} (Cảm ơn bạn đã cập nhật về {primary_topic}.)"
+            else:
+                stream_2b_en = selected_filler[0]
+                stream_2b_vi = selected_filler[1]
 
 
         return {

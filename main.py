@@ -5,20 +5,21 @@ import sys
 import os
 import threading
 import time
-from PySide6.QtWidgets import QApplication, QPushButton, QHBoxLayout
-from PySide6.QtCore import Qt
 
+# IMPORT CORE ENGINES FIRST TO PREVENT PYSIDE6 SHIBOKEN IMPORT BUGS WITH VOSK/REQUESTS
 from config import Config
-from gui.overlay_window import OverlayWindow
 from core.audio_capturer import AudioCapturer
 from core.translator_engine import TranslatorEngine
 from core.smart_reply_engine import SmartReplyEngine
+from core.stt_engine import STTEngine
 from tests.mock_audio_generator import MockAudioGenerator
 from utils.logger import logger
 
-from core.stt_engine import STTEngine
+# THEN IMPORT PYSIDE6
+from PySide6.QtWidgets import QApplication, QPushButton, QHBoxLayout
+from PySide6.QtCore import Qt, QLockFile, QDir
 
-from PySide6.QtCore import QLockFile, QDir
+from gui.overlay_window import OverlayWindow
 
 class AppController:
     def __init__(self):
@@ -54,7 +55,7 @@ class AppController:
 
     def on_partial_audio_received(self, channel_type: str, partial_text: str):
         """Luồng 1c: Independent live word-by-word streaming display."""
-        if channel_type == "incoming" and partial_text and partial_text.strip():
+        if channel_type == "incoming":
             self.overlay.signal_stream1c.emit(partial_text.strip())
 
 
@@ -103,22 +104,26 @@ class AppController:
         def run_stream_1a():
             # 2. Fetch Vietnamese translation asynchronously and update line
             vi_trans = self.translator.translate_en_to_vi(english_text)
+            logger.info(f"[STREAM 1A] EN: '{english_text}' -> VI: '{vi_trans}'")
             self.overlay.signal_stream1a.emit(english_text, vi_trans)
 
 
         # --- LUỒNG 1B: Giải thích Ý nghĩa Tiếng Việt ---
         def run_stream_1b():
             vi_explanation = self.translator.explain_context_vi(english_text)
+            logger.info(f"[STREAM 1B] Context: '{vi_explanation}'")
             self.overlay.signal_stream1b.emit(vi_explanation)
 
         # --- LUỒNG 2A: Từ khóa siêu tốc (< 150ms) ---
         def run_stream_2a():
             keywords = self.smart_reply.generate_stream_2a_keywords(english_text)
+            logger.info(f"[STREAM 2A] Keywords: '{keywords}'")
             self.overlay.signal_stream2a.emit(keywords)
 
         # --- LUỒNG 2B: Câu trả lời Tiếng Anh chuẩn mực (< 400ms) ---
         def run_stream_2b():
             response_dict = self.smart_reply.generate_stream_2b_response(english_text)
+            logger.info(f"[STREAM 2B] Reply EN: '{response_dict['english']}' | Reply VI: '{response_dict['vietnamese']}'")
             self.overlay.signal_stream2b.emit(response_dict["english"], response_dict["vietnamese"])
 
         # Execute parallel workers for minimal latency
