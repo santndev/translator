@@ -121,8 +121,8 @@ def verify_out_of_order_results_follow_utterance_order():
     ]
     assert "reply twelve" in dashboard.reply_region.content_label.text()
     assert dashboard.reply_region.content_label.text().index(
-        "quick twelve"
-    ) < dashboard.reply_region.content_label.text().index("quick eleven")
+        "quick eleven"
+    ) < dashboard.reply_region.content_label.text().index("quick twelve")
     assert "reply eleven" not in dashboard.reply_region.content_label.text()
 
 
@@ -244,7 +244,7 @@ def verify_new_content_returns_each_region_to_its_focus_anchor():
     QApplication.processEvents()
 
     assert live_bar.value() == live_bar.maximum()
-    assert keyword_bar.value() == 0
+    assert keyword_bar.value() == keyword_bar.maximum()
     dashboard.close()
 
 
@@ -271,7 +271,40 @@ def verify_new_contextual_translation_returns_to_its_focus_anchor():
     )
     QApplication.processEvents()
 
-    assert context_bar.value() == 0
+    assert context_bar.value() == context_bar.maximum()
+    dashboard.close()
+
+
+def verify_all_history_regions_follow_top_to_bottom_and_scroll_to_bottom():
+    dashboard = make_dashboard()
+    dashboard.resize(640, 500)
+    dashboard.show()
+    long_text = "nội dung mới nhất " * 55
+    for utterance_id in range(1, 9):
+        dashboard.update_stream1a(
+            utterance_id, f"English {utterance_id}", long_text
+        )
+        dashboard.update_contextual_translation(
+            utterance_id, f"Context {utterance_id}", long_text
+        )
+        dashboard.update_stream1b(utterance_id, long_text)
+        dashboard.update_stream2a(
+            utterance_id, ", ".join([f"keyword-{utterance_id}"] * 60)
+        )
+        dashboard.update_stream2b(
+            utterance_id,
+            f"quick-{utterance_id} " + long_text,
+            long_text,
+            long_text,
+            long_text,
+            True,
+        )
+    QApplication.processEvents()
+
+    for region in dashboard.regions:
+        scroll_bar = region.scroll.verticalScrollBar()
+        assert scroll_bar.maximum() > 0, region.title
+        assert scroll_bar.value() == scroll_bar.maximum(), region.title
     dashboard.close()
 
 
@@ -293,7 +326,7 @@ def verify_contextual_translation_keeps_bounded_scrollable_history():
     assert region.history[-1][1].startswith("Bản dịch ngữ cảnh 10")
     rendered = region.content_label.text()
     assert "ngữ cảnh 2 " not in rendered
-    assert rendered.index("ngữ cảnh 10") < rendered.index("ngữ cảnh 9")
+    assert rendered.index("ngữ cảnh 9") < rendered.index("ngữ cảnh 10")
     assert region.scroll.verticalScrollBar().maximum() > 0
     dashboard.close()
 
@@ -407,6 +440,20 @@ def verify_session_controls_have_stable_states_and_accessible_names():
     overlay.set_recording_state(False, "C:/recordings/call.wav")
     assert not overlay.btn_record.isChecked()
     assert overlay.btn_replay.isEnabled()
+    requested_actions = []
+    overlay.signal_replay_action.connect(requested_actions.append)
+    overlay.btn_replay.click()
+    overlay.set_replay_state("pause")
+    assert overlay.btn_replay.text() == "⏸"
+    assert overlay.btn_replay.accessibleName() == "Pause replay"
+    overlay.btn_replay.click()
+    overlay.set_replay_state("stop")
+    assert overlay.btn_replay.text() == "■"
+    assert overlay.btn_replay.accessibleName() == "Stop replay"
+    overlay.btn_replay.click()
+    overlay.set_replay_state("play")
+    assert overlay.btn_replay.text() == "▶"
+    assert requested_actions == ["play", "pause", "stop"]
 
 
 if __name__ == "__main__":
@@ -424,6 +471,7 @@ if __name__ == "__main__":
     verify_context_english_updates_and_rejects_stale_results()
     verify_new_content_returns_each_region_to_its_focus_anchor()
     verify_new_contextual_translation_returns_to_its_focus_anchor()
+    verify_all_history_regions_follow_top_to_bottom_and_scroll_to_bottom()
     verify_contextual_translation_keeps_bounded_scrollable_history()
     verify_contextual_translation_uses_fixed_third_row()
     verify_frameless_window_resize_hit_regions()

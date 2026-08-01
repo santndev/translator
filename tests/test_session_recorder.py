@@ -8,7 +8,8 @@ def test_recorder_writes_playable_pcm_wav(tmp_path):
     recorder = SessionRecorder(tmp_path)
     pcm = struct.pack("<hhhh", 0, 1000, -1000, 0)
     recorder.start()
-    recorder.append(pcm, sample_rate=16000, channels=1)
+    assert recorder.append(pcm, sample_rate=16000, channels=1)
+    assert not recorder.append(pcm, sample_rate=16000, channels=1)
     output = recorder.stop()
 
     assert output is not None and output.exists()
@@ -17,7 +18,7 @@ def test_recorder_writes_playable_pcm_wav(tmp_path):
         assert wav_file.getframerate() == 16000
         assert wav_file.getnchannels() == 1
         assert wav_file.getsampwidth() == 2
-        assert wav_file.readframes(4) == pcm
+        assert wav_file.readframes(8) == pcm + pcm
 
 
 def test_recorder_does_not_create_empty_recording(tmp_path):

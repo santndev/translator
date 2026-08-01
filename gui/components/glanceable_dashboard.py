@@ -260,17 +260,15 @@ class HistoryRegion(QFrame):
                 f"<span style='color:#94A3B8'>{escape(self.placeholder)}</span>"
             )
             return
-        # Newest stays at the same, easy-to-find top position.
+        # Use one reading order everywhere: oldest at the top, newest at bottom.
         rendered = [
-            self.formatter(item, index == 0)
-            for index, item in enumerate(reversed(items))
+            self.formatter(item, index == len(items) - 1)
+            for index, item in enumerate(items)
         ]
         self.content_label.setText(
             "<div style='line-height:1.25'>" + "<br><br>".join(rendered) + "</div>"
         )
-        # History regions have a stable focus anchor at the top. Queue scrolling
-        # until Qt has recalculated the rich-text document and scrollbar range.
-        QTimer.singleShot(0, self._scroll_main_to_top)
+        QTimer.singleShot(0, self._scroll_main_to_bottom)
 
     def _render_contextual(self):
         if not self.footer_title:
@@ -288,37 +286,50 @@ class HistoryRegion(QFrame):
         font_size = max(13, min(19, round(14 * self._font_scale)))
         rendered = []
         newest_english = ""
-        for index, (_, item) in enumerate(reversed(contextual_entries)):
+        for index, (_, item) in enumerate(contextual_entries):
             english, vietnamese = item
-            if index == 0:
+            is_newest = index == len(contextual_entries) - 1
+            if is_newest:
                 newest_english = english
-            alpha = 1.0 if index == 0 else 0.58
+            alpha = 1.0 if is_newest else 0.58
             vi_color = apply_opacity_to_hex(
                 "#FDE68A", self._text_opacity * alpha
             )
             rendered.append(
                 f"<span style='color:{vi_color};font-size:{font_size}px;"
-                f"font-weight:{650 if index == 0 else 450};line-height:1.35'>"
+                f"font-weight:{650 if is_newest else 450};line-height:1.35'>"
                 f"{escape(vietnamese)}</span>"
             )
         self.footer_label.setText(
             "<div>" + "<br><br>".join(rendered) + "</div>"
         )
         self.footer_label.setToolTip(newest_english)
-        QTimer.singleShot(0, self._scroll_footer_to_top)
+        QTimer.singleShot(0, self._scroll_footer_to_bottom)
 
-    def _scroll_main_to_top(self):
+    def _scroll_main_to_bottom(self):
         try:
-            self.scroll.verticalScrollBar().setValue(0)
+            scroll_bar = self.scroll.verticalScrollBar()
+            scroll_bar.setValue(scroll_bar.maximum())
         except RuntimeError:
             # A queued UI callback may run after a short-lived test/widget closes.
             pass
 
-    def _scroll_footer_to_top(self):
+    def _scroll_footer_to_bottom(self):
         try:
-            self.footer_scroll.verticalScrollBar().setValue(0)
+            scroll_bar = self.footer_scroll.verticalScrollBar()
+            scroll_bar.setValue(scroll_bar.maximum())
         except RuntimeError:
             pass
+
+    def clear(self):
+        self._items.clear()
+        self._contextual_items.clear()
+        self._visible_snapshot = []
+        self._visible_contextual_snapshot = []
+        self._pending_ids.clear()
+        self._update_badge()
+        self._render()
+        self._render_contextual()
 
     def _copy_latest(self):
         items = self.visible_items
@@ -586,6 +597,13 @@ class LiveEnglishRegion(QFrame):
         except RuntimeError:
             pass
 
+    def clear(self):
+        self._final_items.clear()
+        self._contextual_item = None
+        self.partial = ""
+        self._render()
+        self._render_contextual()
+
     def update_text_opacity(self, opacity: float):
         self._text_opacity = opacity
         self._render()
@@ -756,6 +774,13 @@ class GlanceableDashboard(QWidget):
         self.live_region.update_window_opacity(opacity)
         for region in self.regions:
             region.update_window_opacity(opacity)
+
+    def clear_for_replay(self):
+        """Reset visible streams so replay can rebuild them chronologically."""
+        self.live_region.clear()
+        for region in self.regions:
+            region.set_pinned(False)
+            region.clear()
 
     def _render_all(self):
         self.translation_region._render()

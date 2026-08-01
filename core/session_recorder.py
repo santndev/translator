@@ -48,17 +48,18 @@ class SessionRecorder:
             self._recording = True
             logger.info("Session recording armed.")
 
-    def append(self, pcm_bytes: bytes, sample_rate: int, channels: int) -> None:
-        """Append signed 16-bit PCM captured from the system loopback device."""
+    def append(self, pcm_bytes: bytes, sample_rate: int, channels: int) -> bool:
+        """Append PCM and return True only for the first chunk in this recording."""
         if not pcm_bytes:
-            return
+            return False
         with self._lock:
             if not self._recording:
-                return
+                return False
             audio_format = (int(sample_rate), int(channels))
+            first_chunk = self._writer is None
             if self._writer is None:
                 if self._pending_path is None:
-                    return
+                    return False
                 self._writer = wave.open(str(self._pending_path), "wb")
                 self._writer.setnchannels(audio_format[1])
                 self._writer.setsampwidth(2)
@@ -69,9 +70,10 @@ class SessionRecorder:
                     "Ignored recording chunk with changed audio format: "
                     f"expected={self._format}, received={audio_format}"
                 )
-                return
+                return False
             self._writer.writeframesraw(pcm_bytes)
             self._frames_written += len(pcm_bytes)
+            return first_chunk
 
     def stop(self) -> Path | None:
         """Finalize the active WAV and return it, or None when no audio arrived."""

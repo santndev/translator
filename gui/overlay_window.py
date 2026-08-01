@@ -45,7 +45,7 @@ class OverlayWindow(QMainWindow):
     signal_audio_activity = Signal(bool, float)  # is_capturing, volume_energy
     signal_partial_speech = Signal(str)  # live word-by-word streaming text
     signal_recording_toggled = Signal(bool)
-    signal_replay_requested = Signal()
+    signal_replay_action = Signal(str)
     signal_export_requested = Signal()
 
 
@@ -54,6 +54,8 @@ class OverlayWindow(QMainWindow):
         self.drag_position = QPoint()
         self.is_locked = False
         self._geometry_verified_after_show = False
+        self._replay_button_state = "play"
+        self._has_recording = False
         self.state_file = os.path.join(os.path.dirname(__file__), "..", "window_state.json")
         
         self.init_window_flags()
@@ -314,7 +316,7 @@ class OverlayWindow(QMainWindow):
         self.btn_replay.setAccessibleName("Replay latest recording")
         self.btn_replay.setStyleSheet(session_button_style)
         self.btn_replay.setEnabled(False)
-        self.btn_replay.clicked.connect(self.signal_replay_requested.emit)
+        self.btn_replay.clicked.connect(self._request_replay_action)
         self.header_layout.addWidget(self.btn_replay)
 
         self.btn_export = QPushButton("TXT", self)
@@ -546,13 +548,31 @@ class OverlayWindow(QMainWindow):
             "Stop and save recording" if active else "Start recording system audio"
         )
         if recording_path:
+            self._has_recording = True
             self.btn_replay.setToolTip(f"Replay latest recording\n{recording_path}")
-        self.btn_replay.setEnabled(bool(recording_path) and not active)
+        self.btn_replay.setEnabled(
+            self._has_recording and not active
+        )
 
-    def set_replay_state(self, playing: bool):
-        self.btn_replay.setText("■" if playing else "▶")
-        self.btn_replay.setEnabled(not playing and not self.btn_record.isChecked())
-        self.btn_record.setEnabled(not playing)
+    def _request_replay_action(self):
+        self.signal_replay_action.emit(self._replay_button_state)
+
+    def set_replay_state(self, state: str):
+        """Set the action shown by the single Play → Pause → Stop control."""
+        if state not in {"play", "pause", "stop"}:
+            raise ValueError(f"Unsupported replay button state: {state}")
+        self._replay_button_state = state
+        labels = {"play": "▶", "pause": "⏸", "stop": "■"}
+        names = {
+            "play": "Replay latest recording",
+            "pause": "Pause replay",
+            "stop": "Stop replay",
+        }
+        self.btn_replay.setText(labels[state])
+        self.btn_replay.setAccessibleName(names[state])
+        self.btn_replay.setToolTip(names[state])
+        self.btn_replay.setEnabled(self._has_recording or state != "play")
+        self.btn_record.setEnabled(state == "play")
 
 
     def toggle_lock_position(self, checked: bool):

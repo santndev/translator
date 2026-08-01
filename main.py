@@ -3,6 +3,7 @@ Main Entry Point for English Call Assistant & Dual-Stream Overlay Window
 """
 import sys
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from itertools import count
@@ -17,6 +18,7 @@ from core.audio_capturer import AudioCapturer
 from core.conversation_context import ConversationContext
 from core.latest_task_pool import LatestTaskPool
 from core.session_recorder import SessionRecorder
+from core.session_replay import ReplayEvent, SessionReplayTimeline
 from core.session_transcript import SessionTranscript
 from core.translator_engine import TranslatorEngine
 from core.smart_reply_engine import SmartReplyEngine
@@ -69,9 +71,12 @@ class AppController:
         self._conversation_context = ConversationContext()
         self._task_pool = LatestTaskPool(max_workers=4)
         self._recorder = SessionRecorder()
+        self._replay_timeline = SessionReplayTimeline()
         self._session_transcript = SessionTranscript()
         self._replay_active = False
         self._replay_started = False
+        self._replay_events: tuple[ReplayEvent, ...] = ()
+        self._replay_event_index = 0
         self._shutdown_started = False
         self.app.aboutToQuit.connect(self._shutdown)
 
@@ -82,11 +87,14 @@ class AppController:
             self._on_replay_state_changed
         )
         self._replay_player.errorOccurred.connect(self._on_replay_error)
+        self._replay_timer = QTimer(self.app)
+        self._replay_timer.setInterval(25)
+        self._replay_timer.timeout.connect(self._emit_due_replay_events)
 
         self.overlay.signal_recording_toggled.connect(
             self._handle_recording_toggled
         )
-        self.overlay.signal_replay_requested.connect(self._replay_latest)
+        self.overlay.signal_replay_action.connect(self._handle_replay_action)
         self.overlay.signal_export_requested.connect(self._export_session)
 
 
@@ -99,7 +107,7 @@ class AppController:
             stt_engine=self.stt_engine,
             callback_audio_activity=self.on_audio_activity_event,
             callback_partial_speech=self.on_partial_audio_received,
-            callback_recording_audio=self._recorder.append,
+            callback_recording_audio=self._on_recording_audio,
         )
 
     @classmethod
@@ -142,7 +150,19 @@ class AppController:
     def on_partial_audio_received(self, channel_type: str, partial_text: str):
         """Luồng 1c: Independent live word-by-word streaming display."""
         if channel_type == "incoming":
-            self.overlay.signal_stream1c.emit(partial_text.strip())
+            self._emit_stream("signal_stream1c", partial_text.strip())
+
+    def _emit_stream(self, signal_name: str, *payload):
+        """Emit a UI stream and retain it when a recording timeline is active."""
+        getattr(self.overlay, signal_name).emit(*payload)
+        self._replay_timeline.record(signal_name, *payload)
+
+    def _on_recording_audio(
+        self, pcm_bytes: bytes, sample_rate: int, channels: int
+    ):
+        received_at = time.monotonic()
+        if self._recorder.append(pcm_bytes, sample_rate, channels):
+            self._replay_timeline.mark_audio_started(received_at)
 
 
 
@@ -161,17 +181,23 @@ class AppController:
 
         # --- LUỒNG 1A: Dịch Realtime (Live Subtitle - Instant 0ms English Display) ---
         # 1. Emit English transcript IMMEDIATELY (0ms delay)
-        self.overlay.signal_stream1a.emit(utterance_id, english_text, "Đang dịch...")
+        self._emit_stream(
+            "signal_stream1a", utterance_id, english_text, "Đang dịch..."
+        )
         # Keep the contextual English view local and immediate. It must not wait
         # for the slower contextual Vietnamese translation/network path.
-        self.overlay.signal_contextual_english.emit(
-            utterance_id, " ".join(translation_context)
+        self._emit_stream(
+            "signal_contextual_english",
+            utterance_id,
+            " ".join(translation_context),
         )
 
         def publish_translation(vi_trans: str):
             self._session_transcript.record_translation(utterance_id, vi_trans)
             logger.info(f"[STREAM 1A] EN: '{english_text}' -> VI: '{vi_trans}'")
-            self.overlay.signal_stream1a.emit(utterance_id, english_text, vi_trans)
+            self._emit_stream(
+                "signal_stream1a", utterance_id, english_text, vi_trans
+            )
 
         self._task_pool.submit_latest(
             "translation",
@@ -191,7 +217,8 @@ class AppController:
                     f"[STREAM 1A CONTEXT] EN: '{combined_english}' "
                     f"-> VI: '{contextual_vi}'"
                 )
-                self.overlay.signal_stream1a_context.emit(
+                self._emit_stream(
+                    "signal_stream1a_context",
                     utterance_id,
                     combined_english,
                     contextual_vi,
@@ -218,15 +245,16 @@ class AppController:
             self._session_transcript.record_assistance(utterance_id, bundle)
             vi_explanation = bundle["explanation"]
             logger.info(f"[STREAM 1B] Context: '{vi_explanation}'")
-            self.overlay.signal_stream1b.emit(utterance_id, vi_explanation)
+            self._emit_stream("signal_stream1b", utterance_id, vi_explanation)
             fast_bilingual = bundle["keywords"]
             logger.info(f"[STREAM 2A] Keywords: '{fast_bilingual}'")
-            self.overlay.signal_stream2a.emit(utterance_id, fast_bilingual)
+            self._emit_stream("signal_stream2a", utterance_id, fast_bilingual)
             logger.info(
                 f"[STREAM 2B] Reply EN: '{bundle['english']}' | "
                 f"Reply VI: '{bundle['vietnamese']}'"
             )
-            self.overlay.signal_stream2b.emit(
+            self._emit_stream(
+                "signal_stream2b",
                 utterance_id,
                 bundle["quick_english"],
                 bundle["quick_vietnamese"],
@@ -251,9 +279,13 @@ class AppController:
         try:
             if enabled:
                 self._recorder.start()
+                self._replay_timeline.arm()
                 self.overlay.set_recording_state(True)
                 return
             saved_path = self._recorder.stop()
+            self._replay_events = self._replay_timeline.finish(
+                has_audio=saved_path is not None
+            )
             latest = saved_path or self._recorder.last_recording_path
             self.overlay.set_recording_state(False, str(latest or ""))
         except Exception as error:
@@ -266,7 +298,15 @@ class AppController:
                 self.overlay, "Recording error", f"Could not record audio:\n{error}"
             )
 
-    def _replay_latest(self):
+    def _handle_replay_action(self, action: str):
+        if action == "play":
+            self._start_replay()
+        elif action == "pause":
+            self._pause_replay()
+        elif action == "stop":
+            self._finish_replay(flush_remaining=False, stop_player=True)
+
+    def _start_replay(self):
         recording_path = self._recorder.last_recording_path
         if not recording_path or not recording_path.exists():
             self.overlay.set_recording_state(False)
@@ -276,8 +316,11 @@ class AppController:
             return
         self._replay_started = False
         self._replay_active = True
+        self._replay_events = self._replay_timeline.last_events
+        self._replay_event_index = 0
         self.audio_capturer.set_processing_enabled(False)
-        self.overlay.set_replay_state(True)
+        self.overlay.dashboard.clear_for_replay()
+        self.overlay.set_replay_state("pause")
         self._replay_player.setSource(QUrl.fromLocalFile(str(recording_path)))
         self._replay_player.play()
         QTimer.singleShot(3000, self._verify_replay_started)
@@ -286,7 +329,7 @@ class AppController:
     def _verify_replay_started(self):
         if self._replay_active and not self._replay_started:
             logger.warning("Replay did not start within three seconds.")
-            self._finish_replay()
+            self._finish_replay(flush_remaining=False, stop_player=True)
             QMessageBox.warning(
                 self.overlay,
                 "Replay error",
@@ -298,29 +341,62 @@ class AppController:
             return
         if state == QMediaPlayer.PlaybackState.PlayingState:
             self._replay_started = True
+            self._replay_timer.start()
         elif (
             state == QMediaPlayer.PlaybackState.StoppedState
             and self._replay_started
         ):
-            self._finish_replay()
+            self._finish_replay(flush_remaining=True, stop_player=False)
+
+    def _pause_replay(self):
+        if not self._replay_active:
+            return
+        self._replay_player.pause()
+        self._replay_timer.stop()
+        self.overlay.set_replay_state("stop")
+        logger.info("Session replay paused.")
+
+    def _emit_due_replay_events(self):
+        position_ms = self._replay_player.position()
+        while self._replay_event_index < len(self._replay_events):
+            event = self._replay_events[self._replay_event_index]
+            if event.offset_ms > position_ms + 25:
+                break
+            getattr(self.overlay, event.stream).emit(*event.payload)
+            self._replay_event_index += 1
+
+    def _emit_remaining_replay_events(self):
+        while self._replay_event_index < len(self._replay_events):
+            event = self._replay_events[self._replay_event_index]
+            getattr(self.overlay, event.stream).emit(*event.payload)
+            self._replay_event_index += 1
 
     def _on_replay_error(self, error, error_string: str):
         if not self._replay_active:
             return
         logger.warning(f"Replay failed ({error}): {error_string}")
-        self._finish_replay()
+        self._finish_replay(flush_remaining=False, stop_player=False)
         QMessageBox.warning(
             self.overlay, "Replay error", error_string or "Could not replay audio."
         )
 
-    def _finish_replay(self):
+    def _finish_replay(self, flush_remaining: bool, stop_player: bool):
+        if not self._replay_active:
+            self.overlay.set_replay_state("play")
+            return
         self._replay_active = False
         self._replay_started = False
+        self._replay_timer.stop()
+        if stop_player:
+            self._replay_player.stop()
+        if flush_remaining:
+            self._emit_remaining_replay_events()
         self.audio_capturer.set_processing_enabled(True)
-        self.overlay.set_replay_state(False)
+        self.overlay.set_replay_state("play")
         self.overlay.set_recording_state(
             False, str(self._recorder.last_recording_path or "")
         )
+        logger.info("Session replay stopped.")
 
     def _export_session(self):
         export_dir = Path.home() / "Documents" / "Translator" / "Exports"
@@ -360,7 +436,7 @@ class AppController:
             return
         self._shutdown_started = True
         if self._replay_active:
-            self._replay_player.stop()
+            self._finish_replay(flush_remaining=False, stop_player=True)
         self._recorder.close()
         self.audio_capturer.stop_capture()
         self._task_pool.shutdown()
