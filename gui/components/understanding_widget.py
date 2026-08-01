@@ -3,7 +3,7 @@ Understanding Widget - Minimalist Results Display
 - Live Subtitle Stack: English spoken transcript + Direct Vietnamese translation
 - Context Insight: Rolling buffer explanation
 """
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QScrollArea, QSizePolicy
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QScrollArea, QSizePolicy, QGraphicsOpacityEffect
 from PySide6.QtCore import Qt
 from config import Config
 
@@ -94,6 +94,16 @@ class UnderstandingWidget(QWidget):
         self.scroll_1c, self.lbl_1c = self._create_scroll_area(self.main_box)
         self.scroll_1a, self.lbl_1a = self._create_scroll_area(self.main_box)
         self.scroll_1b, self.lbl_1b = self._create_scroll_area(self.main_box)
+
+        # Attach graphics opacity effects to text labels
+        self.effect_1c = QGraphicsOpacityEffect(self.lbl_1c)
+        self.lbl_1c.setGraphicsEffect(self.effect_1c)
+
+        self.effect_1a = QGraphicsOpacityEffect(self.lbl_1a)
+        self.lbl_1a.setGraphicsEffect(self.effect_1a)
+
+        self.effect_1b = QGraphicsOpacityEffect(self.lbl_1b)
+        self.lbl_1b.setGraphicsEffect(self.effect_1b)
 
         left_layout = QVBoxLayout()
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -230,3 +240,9 @@ class UnderstandingWidget(QWidget):
         self._render_stream1c()
         self._render_stream1a()
         self._render_stream1b()
+
+    def update_text_opacity(self, opacity: float):
+        """Updates text opacity (0.1 to 1.0) of all stream 1 labels."""
+        self.effect_1c.setOpacity(opacity)
+        self.effect_1a.setOpacity(opacity)
+        self.effect_1b.setOpacity(opacity)

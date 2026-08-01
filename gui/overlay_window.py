@@ -187,13 +187,18 @@ class OverlayWindow(QMainWindow):
         self.btn_lock.toggled.connect(self.toggle_lock_position)
         self.header_layout.addWidget(self.btn_lock)
 
-        # Opacity Slider
+        # Window Opacity Slider
+        self.lbl_win_op = QLabel("🪟", self)
+        self.lbl_win_op.setToolTip("Window Opacity")
+        self.lbl_win_op.setStyleSheet("color: #94A3B8; font-size: 11px;")
+        self.header_layout.addWidget(self.lbl_win_op)
+
         self.slider_opacity = QSlider(Qt.Horizontal, self)
         self.slider_opacity.setRange(40, 100)
         self.slider_opacity.setValue(int(Config.WINDOW_OPACITY * 100))
-        self.slider_opacity.setFixedWidth(65)
+        self.slider_opacity.setFixedWidth(55)
         self.slider_opacity.setCursor(Qt.PointingHandCursor)
-        self.slider_opacity.setToolTip("Opacity")
+        self.slider_opacity.setToolTip("Window Opacity")
         self.slider_opacity.setStyleSheet("""
             QSlider::groove:horizontal {
                 height: 4px;
@@ -214,6 +219,39 @@ class OverlayWindow(QMainWindow):
         """)
         self.slider_opacity.valueChanged.connect(self.change_opacity)
         self.header_layout.addWidget(self.slider_opacity)
+
+        # Stream Text Opacity Slider (Adjusts text opacity only)
+        self.lbl_txt_op = QLabel("🔤", self)
+        self.lbl_txt_op.setToolTip("Stream Text Opacity")
+        self.lbl_txt_op.setStyleSheet("color: #94A3B8; font-size: 11px;")
+        self.header_layout.addWidget(self.lbl_txt_op)
+
+        self.slider_text_opacity = QSlider(Qt.Horizontal, self)
+        self.slider_text_opacity.setRange(20, 100)
+        self.slider_text_opacity.setValue(100)
+        self.slider_text_opacity.setFixedWidth(55)
+        self.slider_text_opacity.setCursor(Qt.PointingHandCursor)
+        self.slider_text_opacity.setToolTip("Stream Text Opacity")
+        self.slider_text_opacity.setStyleSheet("""
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: rgba(255, 255, 255, 0.15);
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #38BDF8;
+                width: 12px;
+                height: 12px;
+                margin-top: -4px;
+                margin-bottom: -4px;
+                border-radius: 6px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #7DD3FC;
+            }
+        """)
+        self.slider_text_opacity.valueChanged.connect(self.change_text_opacity)
+        self.header_layout.addWidget(self.slider_text_opacity)
 
         # Taskbar Icon Visibility Checkbox (Default: Unchecked -> App Icon visible on Taskbar)
         self.chk_hide_taskbar = QCheckBox("Hide Taskbar", self)
@@ -310,6 +348,14 @@ class OverlayWindow(QMainWindow):
 
     def change_opacity(self, value: int):
         self.setWindowOpacity(value / 100.0)
+
+    def change_text_opacity(self, value: int):
+        """Adjusts opacity of text across all streams (Stream 1a, 1b, 1c, 2a, 2b)."""
+        opacity = value / 100.0
+        if hasattr(self, 'understanding_widget'):
+            self.understanding_widget.update_text_opacity(opacity)
+        if hasattr(self, 'smart_reply_widget'):
+            self.smart_reply_widget.update_text_opacity(opacity)
 
     def toggle_hide_taskbar(self, hide: bool):
         """Toggles hiding/showing app icon on Windows Taskbar."""

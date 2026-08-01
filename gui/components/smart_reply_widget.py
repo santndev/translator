@@ -3,7 +3,7 @@ Smart Reply Widget - Minimalist Results Display
 - Stream 2a: Flash Keywords (Minimal pill badges/chips)
 - Stream 2b: Best English Reply (Clean prominent answer card with subtle 1-click copy action)
 """
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QPushButton, QScrollArea, QSizePolicy
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QPushButton, QScrollArea, QSizePolicy, QGraphicsOpacityEffect
 from PySide6.QtCore import Qt, QTimer
 from config import Config
 from utils.helpers import copy_to_clipboard
@@ -155,7 +155,15 @@ class SmartReplyWidget(QWidget):
         self.reply_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.reply_scroll.setWidget(reply_content)
         self.reply_scroll.setMinimumHeight(75)
-        card_layout.addWidget(self.reply_scroll, 1)
+        # Attach opacity effects to stream 2 text and keyword badges
+        self.effect_keywords = QGraphicsOpacityEffect(self.keywords_container)
+        self.keywords_container.setGraphicsEffect(self.effect_keywords)
+
+        self.effect_reply_en = QGraphicsOpacityEffect(self.lbl_reply_en)
+        self.lbl_reply_en.setGraphicsEffect(self.effect_reply_en)
+
+        self.effect_reply_vi = QGraphicsOpacityEffect(self.lbl_reply_vi)
+        self.lbl_reply_vi.setGraphicsEffect(self.effect_reply_vi)
 
         layout.addWidget(self.reply_card, 1)
 
@@ -258,5 +266,11 @@ class SmartReplyWidget(QWidget):
             copy_to_clipboard(self.current_reply_en)
             self.btn_copy.setText("✓ Copied!")
             QTimer.singleShot(1500, lambda: self.btn_copy.setText("📋 Copy"))
+
+    def update_text_opacity(self, opacity: float):
+        """Updates text opacity (0.1 to 1.0) of stream 2 keywords & reply labels."""
+        self.effect_keywords.setOpacity(opacity)
+        self.effect_reply_en.setOpacity(opacity)
+        self.effect_reply_vi.setOpacity(opacity)
 
 
