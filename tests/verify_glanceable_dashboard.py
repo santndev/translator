@@ -679,11 +679,23 @@ def verify_overlay_signals_preserve_ids():
     )
 
     overlay.signal_ai_status.emit(
-        "local", "Gemini tạm giới hạn — đang dùng chế độ local"
+        "online", "OpenAI", "OpenAI đang hoạt động"
     )
     QApplication.processEvents()
-    assert overlay.lbl_ai_status.text() == "AI LOCAL"
+    assert overlay.lbl_ai_status.text() == "OPENAI"
+
+    overlay.signal_ai_status.emit(
+        "degraded", "Gemini", "OpenAI tạm giới hạn — đang dùng Gemini"
+    )
+    QApplication.processEvents()
+    assert overlay.lbl_ai_status.text() == "GEMINI"
     assert "tạm giới hạn" in overlay.lbl_ai_status.toolTip()
+
+    overlay.signal_ai_status.emit(
+        "local", "Local", "AI online không sẵn sàng — đang dùng local"
+    )
+    QApplication.processEvents()
+    assert overlay.lbl_ai_status.text() == "LOCAL"
 
 
 def verify_offscreen_window_state_is_clamped():

@@ -1,4 +1,6 @@
-"""Small, shared Gemini REST client with safe credential handling."""
+"""Small OpenAI Responses API client with circuit-breaker fallbacks."""
+
+from __future__ import annotations
 
 import json
 import threading
@@ -9,8 +11,8 @@ import urllib.request
 from config import Config
 
 
-class GeminiAPIError(RuntimeError):
-    """Raised when Gemini cannot return a usable response."""
+class OpenAIAPIError(RuntimeError):
+    """Raised when OpenAI cannot return a usable response."""
 
     def __init__(
         self,
@@ -26,11 +28,13 @@ class GeminiAPIError(RuntimeError):
         self.retry_after_seconds = retry_after_seconds
 
 
-class GeminiCircuitOpenError(GeminiAPIError):
-    """Raised immediately while Gemini is in its local-fallback cooldown."""
+class OpenAICircuitOpenError(OpenAIAPIError):
+    """Raised immediately while OpenAI is in its local-fallback cooldown."""
 
 
-class GeminiClient:
+class OpenAIClient:
+    """Calls the Responses API without persisting conversation content."""
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -41,10 +45,10 @@ class GeminiClient:
         clock=None,
     ):
         self._api_key_override = api_key
-        self.model = model or Config.GEMINI_MODEL
-        self.api_base = (api_base or Config.GEMINI_API_BASE).rstrip("/")
+        self.model = model or Config.OPENAI_MODEL
+        self.api_base = (api_base or Config.OPENAI_API_BASE).rstrip("/")
         self.timeout_seconds = (
-            Config.GEMINI_TIMEOUT_SECONDS
+            Config.OPENAI_TIMEOUT_SECONDS
             if timeout_seconds is None
             else timeout_seconds
         )
@@ -56,15 +60,15 @@ class GeminiClient:
         self._open_until = 0.0
         self._status_state = "online" if self.is_configured else "off"
         self._status_message = (
-            "Gemini sẵn sàng"
+            "OpenAI sẵn sàng"
             if self.is_configured
-            else "Chưa cấu hình Gemini — đang dùng chế độ local"
+            else "Chưa cấu hình OpenAI"
         )
 
     @property
     def api_key(self) -> str:
         return (
-            Config.GEMINI_API_KEY
+            Config.TRANSLATOR_OPENAI_API_KEY
             if self._api_key_override is None
             else self._api_key_override
         )
@@ -75,10 +79,9 @@ class GeminiClient:
 
     @property
     def provider_name(self) -> str:
-        return "Gemini"
+        return "OpenAI"
 
     def add_status_listener(self, listener, *, emit_current: bool = True):
-        """Observe availability changes without coupling this core client to Qt."""
         with self._lock:
             self._listeners.append(listener)
             snapshot = (self._status_state, self._status_message)
@@ -93,16 +96,18 @@ class GeminiClient:
         self,
         prompt: str,
         *,
+        max_output_tokens: int = 256,
+        reasoning_effort: str | None = None,
+        thinking_level: str | None = None,
         temperature: float | None = None,
-        max_output_tokens: int = 1024,
-        thinking_level: str = "minimal",
     ) -> str:
+        del thinking_level, temperature
         self._ensure_available()
         text = self._generate(
             prompt,
-            temperature=temperature,
             max_output_tokens=max_output_tokens,
-            thinking_level=thinking_level,
+            reasoning_effort=reasoning_effort,
+            json_schema=None,
         )
         self._record_success()
         return text
@@ -111,29 +116,31 @@ class GeminiClient:
         self,
         prompt: str,
         *,
+        max_output_tokens: int = 512,
+        reasoning_effort: str | None = None,
+        thinking_level: str | None = None,
         temperature: float | None = None,
-        max_output_tokens: int = 1024,
-        thinking_level: str = "minimal",
+        json_schema: dict | None = None,
     ) -> dict:
+        del thinking_level, temperature
         self._ensure_available()
         raw = self._generate(
             prompt,
-            temperature=temperature,
             max_output_tokens=max_output_tokens,
-            thinking_level=thinking_level,
-            response_mime_type="application/json",
+            reasoning_effort=reasoning_effort,
+            json_schema=json_schema,
         )
         try:
             value = json.loads(raw)
         except json.JSONDecodeError as error:
-            api_error = GeminiAPIError(
-                "Gemini returned invalid JSON", category="response"
+            api_error = OpenAIAPIError(
+                "OpenAI returned invalid JSON", category="response"
             )
             self._record_failure(api_error)
             raise api_error from error
         if not isinstance(value, dict):
-            api_error = GeminiAPIError(
-                "Gemini JSON response must be an object", category="response"
+            api_error = OpenAIAPIError(
+                "OpenAI JSON response must be an object", category="response"
             )
             self._record_failure(api_error)
             raise api_error
@@ -144,38 +151,46 @@ class GeminiClient:
         self,
         prompt: str,
         *,
-        temperature: float | None,
         max_output_tokens: int,
-        thinking_level: str,
-        response_mime_type: str | None = None,
+        reasoning_effort: str | None,
+        json_schema: dict | None,
     ) -> str:
         if not self.is_configured:
-            raise GeminiAPIError(
-                "Gemini API key is not configured", category="configuration"
+            raise OpenAIAPIError(
+                "OpenAI API key is not configured", category="configuration"
             )
 
-        generation_config = {
-            "maxOutputTokens": max_output_tokens,
-            "thinkingConfig": {"thinkingLevel": thinking_level},
-        }
-        if temperature is not None:
-            generation_config["temperature"] = temperature
-        if response_mime_type:
-            generation_config["responseMimeType"] = response_mime_type
+        effort = (reasoning_effort or Config.OPENAI_REASONING_EFFORT).lower()
+        if effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
+            effort = "none"
+        text_config: dict = {"verbosity": "low"}
+        if json_schema is None:
+            text_config["format"] = {"type": "text"}
+        else:
+            text_config["format"] = {
+                "type": "json_schema",
+                "name": "conversation_assistance",
+                "strict": True,
+                "schema": json_schema,
+            }
 
         payload = json.dumps(
             {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": generation_config,
-            }
+                "model": self.model,
+                "input": prompt,
+                "max_output_tokens": max_output_tokens,
+                "reasoning": {"effort": effort},
+                "text": text_config,
+                "store": False,
+            },
+            ensure_ascii=False,
         ).encode("utf-8")
-        url = f"{self.api_base}/models/{self.model}:generateContent"
         request = urllib.request.Request(
-            url,
+            f"{self.api_base}/responses",
             data=payload,
             headers={
+                "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
-                "x-goog-api-key": self.api_key,
             },
             method="POST",
         )
@@ -183,13 +198,10 @@ class GeminiClient:
             with self._urlopen(request, timeout=self.timeout_seconds) as response:
                 data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
-            try:
-                detail = error.read(512).decode("utf-8", errors="replace")
-            except Exception:
-                detail = ""
+            detail = self._read_error_detail(error)
             suffix = f": {detail}" if detail else ""
-            api_error = GeminiAPIError(
-                f"Gemini HTTP {error.code}{suffix}",
+            api_error = OpenAIAPIError(
+                f"OpenAI HTTP {error.code}{suffix}",
                 status_code=error.code,
                 category=self._http_error_category(error.code),
                 retry_after_seconds=self._retry_after_seconds(error),
@@ -197,56 +209,65 @@ class GeminiClient:
             self._record_failure(api_error)
             raise api_error from error
         except (urllib.error.URLError, TimeoutError) as error:
-            api_error = GeminiAPIError(
-                f"Gemini connection failed: {error}", category="connection"
+            api_error = OpenAIAPIError(
+                f"OpenAI connection failed: {error}", category="connection"
             )
             self._record_failure(api_error)
             raise api_error from error
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
-            api_error = GeminiAPIError(
-                "Gemini returned an unreadable response", category="response"
+            api_error = OpenAIAPIError(
+                "OpenAI returned an unreadable response", category="response"
             )
             self._record_failure(api_error)
             raise api_error from error
 
-        try:
-            parts = data["candidates"][0]["content"]["parts"]
-            text = "".join(part.get("text", "") for part in parts).strip()
-        except (KeyError, IndexError, TypeError) as error:
-            api_error = GeminiAPIError(
-                "Gemini response did not contain generated text",
-                category="response",
-            )
-            self._record_failure(api_error)
-            raise api_error from error
+        text = self._extract_output_text(data)
         if not text:
-            api_error = GeminiAPIError(
-                "Gemini returned empty generated text", category="response"
+            api_error = OpenAIAPIError(
+                "OpenAI response did not contain generated text",
+                category="response",
             )
             self._record_failure(api_error)
             raise api_error
         return text
 
+    @staticmethod
+    def _extract_output_text(data: dict) -> str:
+        top_level = data.get("output_text")
+        if isinstance(top_level, str) and top_level.strip():
+            return top_level.strip()
+        parts = []
+        for item in data.get("output", []):
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            for content in item.get("content", []):
+                if (
+                    isinstance(content, dict)
+                    and content.get("type") == "output_text"
+                    and isinstance(content.get("text"), str)
+                ):
+                    parts.append(content["text"])
+        return "".join(parts).strip()
+
     def _ensure_available(self):
         if not self.is_configured:
-            raise GeminiAPIError(
-                "Gemini API key is not configured", category="configuration"
+            raise OpenAIAPIError(
+                "OpenAI API key is not configured", category="configuration"
             )
-
         notify = None
         with self._lock:
             now = self._clock()
             if self._open_until > now:
                 remaining = max(1, round(self._open_until - now))
-                raise GeminiCircuitOpenError(
-                    f"Gemini cooldown active for {remaining}s",
+                raise OpenAICircuitOpenError(
+                    f"OpenAI cooldown active for {remaining}s",
                     category="circuit_open",
                     retry_after_seconds=remaining,
                 )
             if self._open_until:
                 self._open_until = 0.0
                 notify = self._set_status_locked(
-                    "probing", "Đang thử kết nối lại Gemini"
+                    "probing", "Đang thử kết nối lại OpenAI"
                 )
         self._notify(notify)
 
@@ -254,41 +275,38 @@ class GeminiClient:
         with self._lock:
             self._consecutive_failures = 0
             self._open_until = 0.0
-            notify = self._set_status_locked("online", "Gemini đang hoạt động")
+            notify = self._set_status_locked("online", "OpenAI đang hoạt động")
         self._notify(notify)
 
-    def _record_failure(self, error: GeminiAPIError):
+    def _record_failure(self, error: OpenAIAPIError):
         now = self._clock()
         with self._lock:
             self._consecutive_failures += 1
-            opens_immediately = error.category in {
-                "rate_limit",
-                "authorization",
-            }
+            opens_immediately = error.category in {"rate_limit", "authorization"}
             should_open = opens_immediately or (
                 error.category in {"connection", "service", "response"}
                 and self._consecutive_failures
-                >= max(1, Config.GEMINI_FAILURE_THRESHOLD)
+                >= max(1, Config.OPENAI_FAILURE_THRESHOLD)
             )
             if should_open:
                 default_cooldown = (
-                    Config.GEMINI_RATE_LIMIT_COOLDOWN_SECONDS
+                    Config.OPENAI_RATE_LIMIT_COOLDOWN_SECONDS
                     if opens_immediately
-                    else Config.GEMINI_RETRY_COOLDOWN_SECONDS
+                    else Config.OPENAI_RETRY_COOLDOWN_SECONDS
                 )
                 requested = error.retry_after_seconds or default_cooldown
                 cooldown = max(
                     5.0,
-                    min(float(requested), Config.GEMINI_MAX_COOLDOWN_SECONDS),
+                    min(float(requested), Config.OPENAI_MAX_COOLDOWN_SECONDS),
                 )
                 self._open_until = max(self._open_until, now + cooldown)
                 notify = self._set_status_locked(
                     "local",
-                    f"Gemini tạm giới hạn — dùng local trong {round(cooldown)} giây",
+                    f"OpenAI tạm giới hạn — dùng fallback trong {round(cooldown)} giây",
                 )
             else:
                 notify = self._set_status_locked(
-                    "degraded", "Gemini đang lỗi — câu này dùng chế độ local"
+                    "degraded", "OpenAI đang lỗi — câu này dùng fallback"
                 )
         self._notify(notify)
 
@@ -308,7 +326,6 @@ class GeminiClient:
             try:
                 listener(state, message)
             except Exception:
-                # Status reporting must never fail an AI request or fallback.
                 continue
 
     @staticmethod
@@ -330,3 +347,13 @@ class GeminiClient:
             return max(0.0, float(value))
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _read_error_detail(error: urllib.error.HTTPError) -> str:
+        try:
+            raw = error.read(2048).decode("utf-8", errors="replace")
+            data = json.loads(raw)
+            message = data.get("error", {}).get("message", "")
+            return str(message).replace("\r", " ").replace("\n", " ")[:300]
+        except Exception:
+            return ""

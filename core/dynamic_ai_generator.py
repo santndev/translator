@@ -1,11 +1,12 @@
 """
 Dynamic AI Model & NLP Generator Engine
 Generates dynamic contextual responses without hardcoded answer templates.
-Supports Cloud LLM APIs (Gemini, Groq, OpenAI) with fast local NLP dynamic fallback.
+Supports cloud AI providers with fast local NLP fallback.
 """
 import re
 import time
-from core.gemini_client import GeminiClient
+from core.ai_provider import AIProviderRouter
+from core.user_profile import UserProfile
 from utils.logger import logger
 
 class DynamicAIGenerator:
@@ -19,8 +20,25 @@ class DynamicAIGenerator:
         "stream_2b_should_reply",
     )
 
-    def __init__(self, gemini_client=None):
-        self.gemini = gemini_client or GeminiClient()
+    RESPONSE_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "stream_1b": {"type": "string"},
+            "stream_2a": {"type": "string"},
+            "stream_2b_quick_en": {"type": "string"},
+            "stream_2b_quick_vi": {"type": "string"},
+            "stream_2b_en": {"type": "string"},
+            "stream_2b_vi": {"type": "string"},
+            "stream_2b_should_reply": {"type": "boolean"},
+        },
+        "required": list(REQUIRED_STREAM_KEYS),
+        "additionalProperties": False,
+    }
+
+    def __init__(self, gemini_client=None, *, ai_client=None, user_profile=None):
+        # gemini_client remains a compatibility injection point for existing tests.
+        self.ai = ai_client or gemini_client or AIProviderRouter()
+        self.user_profile = user_profile or UserProfile.empty()
 
     def generate_all_streams(self, english_text: str) -> dict:
         """
@@ -41,18 +59,34 @@ class DynamicAIGenerator:
                 "stream_2b_should_reply": False,
             }
 
-        # Try Gemini / Cloud LLM API if key is present
-        if self.gemini.is_configured:
+        profile_reply = self.user_profile.try_answer(english_text)
+        if profile_reply is not None:
+            logger.info(
+                f"Generated deterministic profile reply for {profile_reply.intent}"
+            )
+            return profile_reply.as_stream_bundle()
+
+        # Use the preferred cloud provider, with provider and local fallbacks.
+        if self.ai.is_configured:
             try:
-                return self._generate_via_gemini(english_text)
+                return self._generate_via_cloud(english_text)
             except Exception as e:
-                logger.warning(f"Gemini API fallback to Dynamic NLP Engine: {e}")
+                logger.warning(f"Cloud AI fallback to Dynamic NLP Engine: {e}")
 
         # Dynamic NLP Synthesis (Zero hardcoded text)
         return self._generate_dynamic_nlp(english_text)
 
-    def _generate_via_gemini(self, english_text: str) -> dict:
-        """Use Gemini for content-aware analysis and reply generation."""
+    def _generate_via_cloud(self, english_text: str) -> dict:
+        """Use the selected cloud model for content-aware assistance."""
+        profile_context = self.user_profile.cloud_context(english_text)
+        profile_section = ""
+        if profile_context:
+            profile_section = (
+                "\n\nAUTHORITATIVE USER PROFILE (use only when relevant):\n"
+                f"{profile_context}\n"
+                "Never infer a missing personal fact. If the requested fact is "
+                "absent, ask for clarification or say it is not available."
+            )
         prompt = (
             "You assist a Vietnamese human during a live English conversation. "
             "Write replies that the human can say to the other speaker; never "
@@ -60,7 +94,8 @@ class DynamicAIGenerator:
             "The text before 'Previous context:' is the LATEST utterance and is "
             "always primary. Earlier context only helps resolve references; never "
             "answer an older question instead of the latest utterance.\n\n"
-            f"INPUT:\n{english_text}\n\n"
+            f"INPUT:\n{english_text}"
+            f"{profile_section}\n\n"
             "Return one JSON object with exactly these fields:\n"
             "- stream_1b: concise Vietnamese explanation of the latest meaning, "
             "intent, and relevant context.\n"
@@ -82,10 +117,14 @@ class DynamicAIGenerator:
             "otherwise empty."
         )
         started = time.perf_counter()
-        result = self.gemini.generate_json(
-            prompt, max_output_tokens=650, thinking_level="minimal"
+        result = self.ai.generate_json(
+            prompt,
+            max_output_tokens=500,
+            reasoning_effort="none",
+            thinking_level="minimal",
+            json_schema=self.RESPONSE_SCHEMA,
         )
-        normalized = self._normalize_gemini_result(result)
+        normalized = self._normalize_cloud_result(result)
         if (
             normalized["stream_2b_should_reply"]
             and not self._latest_explicitly_requires_response(english_text)
@@ -107,7 +146,7 @@ class DynamicAIGenerator:
             )
         elapsed_ms = (time.perf_counter() - started) * 1000
         logger.info(
-            f"Gemini {self.gemini.model} generated conversation streams "
+            f"Cloud AI {self.ai.model} generated conversation streams "
             f"in {elapsed_ms:.0f} ms"
         )
         return normalized
@@ -136,10 +175,10 @@ class DynamicAIGenerator:
         )
 
     @classmethod
-    def _normalize_gemini_result(cls, result: dict) -> dict:
+    def _normalize_cloud_result(cls, result: dict) -> dict:
         missing = [key for key in cls.REQUIRED_STREAM_KEYS if key not in result]
         if missing:
-            raise ValueError(f"Gemini response missing fields: {', '.join(missing)}")
+            raise ValueError(f"Cloud response missing fields: {', '.join(missing)}")
 
         normalized = {
             key: str(result.get(key, "")).strip()
@@ -155,7 +194,7 @@ class DynamicAIGenerator:
         }:
             should_reply = raw_should_reply.lower() == "true"
         else:
-            raise ValueError("Gemini should_reply field is not a boolean")
+            raise ValueError("Cloud should_reply field is not a boolean")
         normalized["stream_2b_should_reply"] = should_reply
         if not should_reply:
             normalized.update(

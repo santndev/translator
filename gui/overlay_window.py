@@ -48,7 +48,7 @@ class OverlayWindow(QMainWindow):
     )  # id, quick_en, quick_vi, full_en, full_vi, should_reply
     signal_audio_activity = Signal(bool, float)  # is_capturing, volume_energy
     signal_partial_speech = Signal(str)  # live word-by-word streaming text
-    signal_ai_status = Signal(str, str)  # state, user-facing detail
+    signal_ai_status = Signal(str, str, str)  # state, active provider, detail
     signal_recording_toggled = Signal(bool)
     signal_replay_action = Signal(str)
     signal_export_requested = Signal()
@@ -273,9 +273,9 @@ class OverlayWindow(QMainWindow):
         self.lbl_ai_status.setObjectName("AIStatus")
         self.lbl_ai_status.setFixedSize(54, 20)
         self.lbl_ai_status.setAlignment(Qt.AlignCenter)
-        self.lbl_ai_status.setAccessibleName("Trạng thái Gemini")
+        self.lbl_ai_status.setAccessibleName("Trạng thái AI online")
         st_layout.addWidget(self.lbl_ai_status)
-        self.set_ai_status("online", "Gemini sẵn sàng")
+        self.set_ai_status("off", "Local", "Đang dùng chế độ local")
 
         # Visual Audio Activity Indicator (Shows 🔊 Catching Sound in real-time)
         self.lbl_audio_wave = QLabel("🎙 Ready", self.status_title_box)
@@ -557,19 +557,26 @@ class OverlayWindow(QMainWindow):
                 border-radius: 4px;
             """)
 
-    def set_ai_status(self, state: str, message: str):
+    def set_ai_status(self, state: str, provider: str, message: str):
         """Show degraded AI without moving or blocking the fixed reading zones."""
         presentations = {
-            "online": ("AI", "#86EFAC", "rgba(34,197,94,0.14)"),
-            "probing": ("AI RETRY", "#7DD3FC", "rgba(56,189,248,0.14)"),
-            "degraded": ("AI LOCAL", "#FDE68A", "rgba(245,158,11,0.16)"),
-            "local": ("AI LOCAL", "#FDE68A", "rgba(245,158,11,0.16)"),
-            "off": ("AI OFF", "#94A3B8", "rgba(148,163,184,0.12)"),
+            "online": ("#86EFAC", "rgba(34,197,94,0.14)"),
+            "probing": ("#7DD3FC", "rgba(56,189,248,0.14)"),
+            "degraded": ("#FDE68A", "rgba(245,158,11,0.16)"),
+            "local": ("#FDE68A", "rgba(245,158,11,0.16)"),
+            "off": ("#94A3B8", "rgba(148,163,184,0.12)"),
         }
-        label, color, background = presentations.get(
+        color, background = presentations.get(
             state, presentations["degraded"]
         )
+        normalized_provider = provider.strip().upper()
+        label = (
+            normalized_provider
+            if normalized_provider in {"OPENAI", "GEMINI", "LOCAL"}
+            else "AI"
+        )
         self.lbl_ai_status.setText(label)
+        self.lbl_ai_status.setAccessibleName(f"Dịch vụ AI đang dùng: {label}")
         self.lbl_ai_status.setToolTip(message)
         self.lbl_ai_status.setStyleSheet(
             f"color:{color};background:{background};"

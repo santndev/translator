@@ -8,7 +8,7 @@ import json
 from utils.logger import logger
 
 from core.dynamic_ai_generator import DynamicAIGenerator
-from core.gemini_client import GeminiClient
+from core.ai_provider import AIProviderRouter
 
 class TranslatorEngine:
     CONTEXT_TRANSLATION_MAX_CHARS = 700
@@ -57,11 +57,11 @@ class TranslatorEngine:
         "websocket": "kết nối hai chiều",
     }
 
-    def __init__(self, gemini_client=None):
+    def __init__(self, gemini_client=None, *, ai_client=None):
         # Free Google Translate RPC Endpoint
         self.gt_url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=vi&dt=t&q="
-        self.gemini = gemini_client or GeminiClient()
-        self.ai_generator = DynamicAIGenerator(gemini_client=self.gemini)
+        self.ai = ai_client or gemini_client or AIProviderRouter()
+        self.ai_generator = DynamicAIGenerator(ai_client=self.ai)
 
     def translate_en_to_vi(self, english_text: str) -> str:
         """
@@ -87,7 +87,7 @@ class TranslatorEngine:
             return ""
 
         newest_text = context[-1]
-        if not self.gemini.is_configured:
+        if not self.ai.is_configured:
             return self.translate_en_to_vi(newest_text)
 
         dialogue = "\n".join(
@@ -106,8 +106,11 @@ class TranslatorEngine:
             f"{dialogue}"
         )
         try:
-            return self.gemini.generate_text(
-                prompt, max_output_tokens=1200, thinking_level="minimal"
+            return self.ai.generate_text(
+                prompt,
+                max_output_tokens=300,
+                reasoning_effort="none",
+                thinking_level="minimal",
             ).strip()
         except Exception as error:
             logger.warning(

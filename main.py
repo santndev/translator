@@ -14,9 +14,11 @@ if sys.platform == "win32" and os.getenv("QT_QPA_PLATFORM") == "offscreen":
 
 # IMPORT CORE ENGINES FIRST TO PREVENT PYSIDE6 SHIBOKEN IMPORT BUGS WITH VOSK/REQUESTS
 from config import Config
+from core.ai_provider import AIProviderRouter
 from core.audio_capturer import AudioCapturer
 from core.conversation_context import ConversationContext
 from core.gemini_client import GeminiClient
+from core.openai_client import OpenAIClient
 from core.latest_task_pool import LatestTaskPool
 from core.session_recorder import SessionRecorder
 from core.session_replay import ReplayEvent, SessionReplayTimeline
@@ -24,6 +26,7 @@ from core.session_transcript import SessionTranscript
 from core.translator_engine import TranslatorEngine
 from core.smart_reply_engine import SmartReplyEngine
 from core.stt_engine import STTEngine
+from core.user_profile import UserProfile
 import ctypes
 from utils.logger import logger
 
@@ -101,14 +104,27 @@ class AppController:
 
         # Initialize Core Engines
         self.stt_engine = STTEngine(model_size="tiny.en")
-        # One shared Gemini client means translation and assistance share the
-        # same rate-limit circuit instead of independently hammering the API.
+        # All AI streams share provider circuits. OpenAI is preferred when its
+        # key is configured; Gemini and local logic remain graceful fallbacks.
+        self.openai_client = OpenAIClient()
         self.gemini_client = GeminiClient()
-        self.gemini_client.add_status_listener(
-            self.overlay.signal_ai_status.emit
+        self.ai_client = AIProviderRouter(
+            openai_client=self.openai_client,
+            gemini_client=self.gemini_client,
         )
-        self.translator = TranslatorEngine(gemini_client=self.gemini_client)
-        self.smart_reply = SmartReplyEngine(gemini_client=self.gemini_client)
+        self.ai_client.add_status_listener(
+            lambda state, message: self.overlay.signal_ai_status.emit(
+                state,
+                self.ai_client.active_provider_name,
+                message,
+            )
+        )
+        self.user_profile = UserProfile.load()
+        self.translator = TranslatorEngine(ai_client=self.ai_client)
+        self.smart_reply = SmartReplyEngine(
+            ai_client=self.ai_client,
+            user_profile=self.user_profile,
+        )
         self.audio_capturer = AudioCapturer(
             callback_on_speech=self.on_audio_received,
             stt_engine=self.stt_engine,
