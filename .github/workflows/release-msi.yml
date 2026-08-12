@@ -1,0 +1,63 @@
+name: Build and release MSI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt "pyinstaller>=6.10.0"
+
+      - name: Read version from tag
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Release tags must use vMAJOR.MINOR.PATCH, for example v1.0.4."
+          }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Run focused regression tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q tests/test_app_settings.py tests/test_glanceable_dashboard.py
+
+      - name: Build MSI
+        shell: pwsh
+        run: .\build_msi.ps1 -Version $env:VERSION
+
+      - name: Generate checksum
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem -LiteralPath release -Filter "Translator-$env:VERSION-x64.msi" -File
+          $hash = (Get-FileHash -LiteralPath $msi.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $($msi.Name)" | Out-File -LiteralPath "release\SHA256SUMS.txt" -Encoding ascii
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            "release\Translator-$env:VERSION-x64.msi" `
+            "release\SHA256SUMS.txt" `
+            --repo $env:GITHUB_REPOSITORY `
+            --title "Translator $env:VERSION" `
+            --generate-notes

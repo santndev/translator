@@ -107,3 +107,15 @@ python -m pytest -q
 
 The build downloads WiX 3.14.1 into the ignored `.build-tools` directory and
 leaves only the latest MSI under `release`.
+
+## GitHub Releases
+
+GitHub Actions builds and publishes an MSI only when a version tag is pushed.
+Use the `vMAJOR.MINOR.PATCH` format:
+
+```powershell
+git tag v1.0.4
+git push origin v1.0.4
+```
+
+Normal pushes and pull requests do not create releases.
