@@ -6,3 +6,4 @@ faster-whisper>=1.0.0
 pytest>=7.0.0
 pytest-asyncio>=0.21.0
 vosk
+pyinstaller>=6.10.0
