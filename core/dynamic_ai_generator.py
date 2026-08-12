@@ -1,11 +1,12 @@
 """
 Dynamic AI Model & NLP Generator Engine
 Generates dynamic contextual responses without hardcoded answer templates.
-Supports Cloud LLM APIs (Gemini, Groq, OpenAI) with fast local NLP dynamic fallback.
+Supports cloud AI providers with fast local NLP fallback.
 """
 import re
 import time
-from core.gemini_client import GeminiClient
+from core.ai_provider import AIProviderRouter
+from core.user_profile import UserProfile
 from utils.logger import logger
 
 class DynamicAIGenerator:
@@ -19,8 +20,25 @@ class DynamicAIGenerator:
         "stream_2b_should_reply",
     )
 
-    def __init__(self, gemini_client=None):
-        self.gemini = gemini_client or GeminiClient()
+    RESPONSE_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "stream_1b": {"type": "string"},
+            "stream_2a": {"type": "string"},
+            "stream_2b_quick_en": {"type": "string"},
+            "stream_2b_quick_vi": {"type": "string"},
+            "stream_2b_en": {"type": "string"},
+            "stream_2b_vi": {"type": "string"},
+            "stream_2b_should_reply": {"type": "boolean"},
+        },
+        "required": list(REQUIRED_STREAM_KEYS),
+        "additionalProperties": False,
+    }
+
+    def __init__(self, gemini_client=None, *, ai_client=None, user_profile=None):
+        # gemini_client remains a compatibility injection point for existing tests.
+        self.ai = ai_client or gemini_client or AIProviderRouter()
+        self.user_profile = user_profile or UserProfile.empty()
 
     def generate_all_streams(self, english_text: str) -> dict:
         """
@@ -41,18 +59,42 @@ class DynamicAIGenerator:
                 "stream_2b_should_reply": False,
             }
 
-        # Try Gemini / Cloud LLM API if key is present
-        if self.gemini.is_configured:
+        profile_reply = self.user_profile.try_answer(english_text)
+        if (
+            profile_reply is not None
+            and self._latest_explicitly_requires_response(english_text)
+        ):
+            logger.info(
+                f"Generated deterministic profile reply for {profile_reply.intent}"
+            )
+            return profile_reply.as_stream_bundle()
+
+        # Use the preferred cloud provider, with provider and local fallbacks.
+        if self.ai.is_configured:
             try:
-                return self._generate_via_gemini(english_text)
+                return self._generate_via_cloud(english_text)
             except Exception as e:
-                logger.warning(f"Gemini API fallback to Dynamic NLP Engine: {e}")
+                logger.warning(f"Cloud AI fallback to Dynamic NLP Engine: {e}")
 
         # Dynamic NLP Synthesis (Zero hardcoded text)
         return self._generate_dynamic_nlp(english_text)
 
-    def _generate_via_gemini(self, english_text: str) -> dict:
-        """Use Gemini for content-aware analysis and reply generation."""
+    def _generate_via_cloud(self, english_text: str) -> dict:
+        """Use the selected cloud model for content-aware assistance."""
+        profile_context = self.user_profile.cloud_context(english_text)
+        profile_section = (
+            "\n\nAUTHORITATIVE USER PROFILE (the only allowed source of "
+            "personal facts):\n"
+            f"{profile_context or '(no authorized personal facts relevant to this question)'}\n"
+            "Any requested personal fact or preference not explicitly listed "
+            "above is UNKNOWN. Never turn an example into the human's fact (for "
+            "example, do not invent a hobby, meal, family status, location, or "
+            "feeling). When a fact is UNKNOWN, write a natural non-disclosing "
+            "reply the human can say or briefly turn the question back without "
+            "asserting a concrete fact. Never mention profiles, missing data, "
+            "unavailable information, or ask the human using this app to supply "
+            "an answer during the conversation."
+        )
         prompt = (
             "You assist a Vietnamese human during a live English conversation. "
             "Write replies that the human can say to the other speaker; never "
@@ -60,32 +102,48 @@ class DynamicAIGenerator:
             "The text before 'Previous context:' is the LATEST utterance and is "
             "always primary. Earlier context only helps resolve references; never "
             "answer an older question instead of the latest utterance.\n\n"
-            f"INPUT:\n{english_text}\n\n"
+            f"INPUT:\n{english_text}"
+            f"{profile_section}\n\n"
             "Return one JSON object with exactly these fields:\n"
             "- stream_1b: concise Vietnamese explanation of the latest meaning, "
-            "intent, and relevant context.\n"
-            "- stream_2a: 4-6 keywords from the latest utterance, separated by semicolons.\n"
+            "intent, and relevant context. It must agree with should_reply and "
+            "must not tell the listener to answer when should_reply is false.\n"
+            "- stream_2a: 4-6 high-value English words or short phrases from "
+            "the latest utterance. Format every item as 'English — Vietnamese' "
+            "and separate items with semicolons. Prefer phrases needed to "
+            "understand the meaning; never repeat an item or emit pronouns, "
+            "auxiliary verbs, or standalone yes/no.\n"
             "- stream_2b_should_reply: true only when the listener should respond: "
             "a direct question, request, decision, or action directed at them. Use "
             "false for narration, fillers, acknowledgements, rhetorical or "
             "self-answered questions, informational updates, and statements that "
-            "merely say what someone could/might do. Do not infer a request from "
-            "a modal verb alone.\n"
+            "merely say what someone could/might do. One captured utterance may "
+            "contain both sides of a dialogue: if speech after the final question "
+            "answers it, the listener must not answer again. Do not infer a "
+            "request from a modal verb alone.\n"
             "- stream_2b_quick_en: when a reply is needed, a useful natural reply "
             "of at most 10 words; otherwise empty.\n"
             "- stream_2b_quick_vi: faithful Vietnamese translation of quick_en; "
             "otherwise empty.\n"
             "- stream_2b_en: when needed, a direct professional answer of at most "
             "2 short sentences. Answer the exact question, never use generic "
-            "boilerplate or invent facts; request clarification only when truly needed.\n"
+            "boilerplate or invent facts. If an unknown personal fact or preference "
+            "is requested, give a natural non-disclosing response or turn the "
+            "question back; never say information/data is unavailable and never "
+            "ask the app user what answer they want. Request clarification only "
+            "for ambiguity in the other speaker's request.\n"
             "- stream_2b_vi: faithful Vietnamese translation of stream_2b_en; "
             "otherwise empty."
         )
         started = time.perf_counter()
-        result = self.gemini.generate_json(
-            prompt, max_output_tokens=650, thinking_level="minimal"
+        result = self.ai.generate_json(
+            prompt,
+            max_output_tokens=500,
+            reasoning_effort="none",
+            thinking_level="minimal",
+            json_schema=self.RESPONSE_SCHEMA,
         )
-        normalized = self._normalize_gemini_result(result)
+        normalized = self._normalize_cloud_result(result)
         if (
             normalized["stream_2b_should_reply"]
             and not self._latest_explicitly_requires_response(english_text)
@@ -105,9 +163,16 @@ class DynamicAIGenerator:
                     "stream_2b_vi": "",
                 }
             )
+            normalized["stream_1b"] = self._remove_reply_directives(
+                normalized["stream_1b"]
+            )
+            normalized["stream_1b"] = (
+                normalized["stream_1b"].rstrip()
+                + " Chưa cần phản hồi cho đoạn hiện tại."
+            ).strip()
         elapsed_ms = (time.perf_counter() - started) * 1000
         logger.info(
-            f"Gemini {self.gemini.model} generated conversation streams "
+            f"Cloud AI {self.ai.model} generated conversation streams "
             f"in {elapsed_ms:.0f} ms"
         )
         return normalized
@@ -117,7 +182,13 @@ class DynamicAIGenerator:
         """Conservatively require a direct response cue in the latest turn."""
         latest = english_text.split("\nPrevious context:", 1)[0].strip()
         lowered = latest.lower()
-        if "?" in latest:
+        final_question = latest.rfind("?")
+        if final_question >= 0:
+            trailing = latest[final_question + 1 :].strip(" \t\r\n\"'.,!…-")
+            if trailing and DynamicAIGenerator._looks_like_spoken_answer(
+                trailing
+            ):
+                return False
             return True
         if re.search(
             r"\b(please|let me know|can you|could you|would you|will you|"
@@ -135,17 +206,44 @@ class DynamicAIGenerator:
             )
         )
 
+    @staticmethod
+    def _looks_like_spoken_answer(text: str) -> bool:
+        """Recognize an answer following a question in one captured segment."""
+        lowered = " ".join(text.lower().split())
+        if re.search(
+            r"\b(please|can you|could you|would you|will you|let me know|"
+            r"i need (?:you|your|an? answer)|your (?:input|feedback|decision))\b",
+            lowered,
+        ):
+            return False
+        return bool(
+            re.match(
+                r"^(?:yes|no|sure|of course|not really|absolutely|definitely|"
+                r"maybe|probably|i(?:'m|'ve|'d|'ll)?\b|my\b|"
+                r"we(?:'re|'ve|'d|'ll)?\b|our\b|"
+                r"it(?:'s|'ll)?\b|he(?:'s|'ll)?\b|she(?:'s|'ll)?\b|"
+                r"they(?:'re|'ve|'ll)?\b|about\b|around\b|because\b)",
+                lowered,
+            )
+        )
+
     @classmethod
-    def _normalize_gemini_result(cls, result: dict) -> dict:
+    def _normalize_cloud_result(cls, result: dict) -> dict:
         missing = [key for key in cls.REQUIRED_STREAM_KEYS if key not in result]
         if missing:
-            raise ValueError(f"Gemini response missing fields: {', '.join(missing)}")
+            raise ValueError(f"Cloud response missing fields: {', '.join(missing)}")
 
         normalized = {
             key: str(result.get(key, "")).strip()
             for key in cls.REQUIRED_STREAM_KEYS
             if key != "stream_2b_should_reply"
         }
+        normalized["stream_2a"] = cls._normalize_cloud_keywords(
+            normalized["stream_2a"]
+        )
+        normalized["stream_1b"] = cls._remove_internal_profile_commentary(
+            normalized["stream_1b"]
+        )
         raw_should_reply = result["stream_2b_should_reply"]
         if isinstance(raw_should_reply, bool):
             should_reply = raw_should_reply
@@ -155,7 +253,7 @@ class DynamicAIGenerator:
         }:
             should_reply = raw_should_reply.lower() == "true"
         else:
-            raise ValueError("Gemini should_reply field is not a boolean")
+            raise ValueError("Cloud should_reply field is not a boolean")
         normalized["stream_2b_should_reply"] = should_reply
         if not should_reply:
             normalized.update(
@@ -167,6 +265,68 @@ class DynamicAIGenerator:
                 }
             )
         return normalized
+
+    @staticmethod
+    def _normalize_cloud_keywords(keywords: str) -> str:
+        """Keep cloud keyword chips unique and bounded without a fixed glossary."""
+        unique = []
+        seen = set()
+        for raw_term in keywords.split(";"):
+            term = " ".join(raw_term.strip().split())
+            if not term:
+                continue
+            english_side = re.split(r"\s+[—–-]\s+", term, maxsplit=1)[0]
+            identity = re.sub(r"[^a-z0-9]+", " ", english_side.lower()).strip()
+            if not identity or identity in {
+                "context",
+                "input",
+                "latest utterance",
+                "previous context",
+                "remote",
+                "you",
+            } or identity in seen:
+                continue
+            seen.add(identity)
+            unique.append(term)
+            if len(unique) == 6:
+                break
+        return " ; ".join(unique)
+
+    @staticmethod
+    def _remove_internal_profile_commentary(explanation: str) -> str:
+        """Keep implementation/data availability language out of the UI."""
+        sentences = re.split(r"(?<=[.!?])\s+", explanation.strip())
+        visible = [
+            sentence
+            for sentence in sentences
+            if not re.search(
+                r"\b(hồ sơ|profile|missing (?:data|information)|"
+                r"unavailable (?:data|information)|"
+                r"chưa (?:cung cấp|có) thông tin|"
+                r"không có (?:dữ liệu|thông tin)|"
+                r"thông tin.*chưa (?:được )?(?:xác định|cung cấp))\b",
+                sentence,
+                flags=re.IGNORECASE,
+            )
+        ]
+        return " ".join(visible).strip() or "Đây là câu hỏi trực tiếp dành cho bạn."
+
+    @staticmethod
+    def _remove_reply_directives(explanation: str) -> str:
+        """Remove model advice that conflicts with a deterministic no-reply guard."""
+        sentences = re.split(r"(?<=[.!?])\s+", explanation.strip())
+        visible = [
+            sentence
+            for sentence in sentences
+            if not re.search(
+                r"\b(?:cần|nên|hãy|phải)\s+(?:bạn\s+)?(?:nêu|trả lời|phản hồi)|"
+                r"\bcâu hỏi trực tiếp cần trả lời\b|"
+                r"\b(?:need|should|must)\s+(?:a\s+|your\s+|to\s+)?(?:answer|reply|response)",
+                sentence,
+                flags=re.IGNORECASE,
+            )
+        ]
+        return " ".join(visible).strip()
 
     def _generate_dynamic_nlp(self, english_text: str) -> dict:
         """

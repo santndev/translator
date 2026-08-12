@@ -175,3 +175,45 @@ def test_processing_can_pause_for_replay_without_stopping_capture():
 
     capturer.set_processing_enabled(True)
     assert capturer._processing_enabled.is_set()
+
+
+def test_audio_device_selection_prefers_saved_name_then_windows_default():
+    devices = [
+        {"name": "Monitor", "default": False},
+        {"name": "USB Speakers", "default": True},
+    ]
+
+    assert AudioCapturer.resolve_device_name(devices, "Monitor") == "Monitor"
+    assert (
+        AudioCapturer.resolve_device_name(devices, "Disconnected device")
+        == "USB Speakers"
+    )
+
+
+def test_loopback_device_name_matching_is_exact_after_normalization():
+    assert AudioCapturer._device_names_match(
+        "Speakers (USB Sound Device)",
+        "Speakers (USB Sound Device) [Loopback]",
+    )
+    assert not AudioCapturer._device_names_match(
+        "Speakers (USB)", "Monitor Audio [Loopback]"
+    )
+
+
+def test_changing_audio_device_invalidates_active_capture_sessions():
+    capturer = AudioCapturer.__new__(AudioCapturer)
+    capturer._device_lock = threading.RLock()
+    capturer._device_generation = 4
+    capturer._speaker_device_name = "Old speaker"
+    capturer._microphone_device_name = "Old microphone"
+    capturer._loopback_ready = threading.Event()
+    capturer._loopback_ready.set()
+
+    capturer.select_devices("New speaker", "New microphone")
+
+    assert capturer._current_device_generation() == 5
+    assert capturer._device_selection_snapshot()[1:] == (
+        "New speaker",
+        "New microphone",
+    )
+    assert not capturer._loopback_ready.is_set()

@@ -164,6 +164,8 @@ def test_generator_normalizes_no_reply_and_uses_latest_utterance_prompt():
     assert result["stream_2b_en"] == ""
     assert "LATEST utterance" in fake.prompts[0]
     assert "never answer an older question" in fake.prompts[0]
+    assert "the only allowed source of personal facts" in fake.prompts[0]
+    assert "UNKNOWN" in fake.prompts[0]
 
 
 def test_generator_suppresses_speculative_reply_to_meeting_narration():
@@ -208,6 +210,85 @@ def test_generator_keeps_reply_for_direct_cloud_request():
     assert result["stream_2b_en"]
 
 
+def test_generator_suppresses_question_answered_inside_same_captured_turn():
+    fake = FakeGemini(
+        result={
+            "stream_1b": "Người nói tự trả lời câu hỏi.",
+            "stream_2a": "ride the bus — đi xe buýt; never — không bao giờ",
+            "stream_2b_quick_en": "I rarely take it.",
+            "stream_2b_quick_vi": "Tôi hiếm khi đi.",
+            "stream_2b_en": "I rarely take the bus.",
+            "stream_2b_vi": "Tôi hiếm khi đi xe buýt.",
+            "stream_2b_should_reply": True,
+        }
+    )
+
+    result = DynamicAIGenerator(fake).generate_all_streams(
+        "How often do you ride the bus? I never ride the bus."
+    )
+
+    assert result["stream_2b_should_reply"] is False
+    assert result["stream_2b_en"] == ""
+    assert "Chưa cần phản hồi cho đoạn hiện tại" in result["stream_1b"]
+
+
+def test_generator_keeps_final_unanswered_question_after_an_earlier_answer():
+    assert DynamicAIGenerator._latest_explicitly_requires_response(
+        "Do you have a credit card? Yes, I do. Do you?"
+    )
+
+
+def test_cloud_keywords_are_bilingual_unique_and_bounded():
+    fake = FakeGemini(
+        result={
+            "stream_1b": "Đang nói về tính cách.",
+            "stream_2a": (
+                "optimist — người lạc quan; pessimist — người bi quan; "
+                "optimist — người lạc quan; outlook — góc nhìn"
+            ),
+            "stream_2b_quick_en": "",
+            "stream_2b_quick_vi": "",
+            "stream_2b_en": "",
+            "stream_2b_vi": "",
+            "stream_2b_should_reply": False,
+        }
+    )
+
+    result = DynamicAIGenerator(fake).generate_all_streams(
+        "I'm definitely an optimist."
+    )
+
+    assert result["stream_2a"] == (
+        "optimist — người lạc quan ; pessimist — người bi quan ; "
+        "outlook — góc nhìn"
+    )
+
+
+def test_internal_profile_availability_language_is_hidden_from_context():
+    result = DynamicAIGenerator._remove_internal_profile_commentary(
+        "Người nói hỏi về sở thích của bạn. "
+        "Hồ sơ không có thông tin này nên hãy hỏi ngược lại."
+    )
+
+    assert result == "Người nói hỏi về sở thích của bạn."
+
+
+def test_no_reply_guard_removes_conflicting_reply_instruction():
+    result = DynamicAIGenerator._remove_reply_directives(
+        "Người nói đang tự giới thiệu. Bạn cần trả lời câu hỏi cuối."
+    )
+
+    assert result == "Người nói đang tự giới thiệu."
+
+
+def test_cloud_keywords_hide_internal_context_transport_label():
+    result = DynamicAIGenerator._normalize_cloud_keywords(
+        "previous context — ngữ cảnh trước đó; welcome — chào mừng"
+    )
+
+    assert result == "welcome — chào mừng"
+
+
 def test_contextual_translation_uses_shared_gemini_client():
     fake = FakeGemini(text="Đây là bản dịch liền mạch theo ngữ cảnh.")
     engine = TranslatorEngine(gemini_client=fake)
@@ -219,3 +300,17 @@ def test_contextual_translation_uses_shared_gemini_client():
     assert result == "Đây là bản dịch liền mạch theo ngữ cảnh."
     assert "prepared statement" in fake.prompts[0]
     assert "fixed glossary" in fake.prompts[0]
+    assert "PRIOR CONTEXT (REFERENCE ONLY)" in fake.prompts[0]
+    assert fake.prompts[0].endswith(
+        "LATEST TEXT (TRANSLATE THIS):\nThen it executes the prepared statement."
+    )
+
+
+def test_contextual_translation_removes_transport_speaker_label():
+    fake = FakeGemini(text="REMOTE: Tôi đã ăn canh kimchi.")
+
+    result = TranslatorEngine(gemini_client=fake).translate_contextual_en_to_vi(
+        ["What did you eat?", "I had kimchi stew."]
+    )
+
+    assert result == "Tôi đã ăn canh kimchi."

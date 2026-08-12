@@ -14,7 +14,16 @@ from config import Config
 from utils.logger import logger
 
 class AudioCapturer:
-    def __init__(self, callback_on_speech=None, stt_engine=None, callback_audio_activity=None, callback_partial_speech=None, callback_recording_audio=None):
+    def __init__(
+        self,
+        callback_on_speech=None,
+        stt_engine=None,
+        callback_audio_activity=None,
+        callback_partial_speech=None,
+        callback_recording_audio=None,
+        speaker_device_name: str = "",
+        microphone_device_name: str = "",
+    ):
         """
         callback_on_speech: Function(channel_type: str, text_payload: str, raw_pcm_bytes: bytes)
         callback_audio_activity: Function(is_capturing: bool, volume: float)
@@ -36,6 +45,10 @@ class AudioCapturer:
         self._microphone_stream = None
         self._loopback_ready = threading.Event()
         self._remote_audio_until = 0.0
+        self._device_lock = threading.RLock()
+        self._device_generation = 0
+        self._speaker_device_name = speaker_device_name.strip()
+        self._microphone_device_name = microphone_device_name.strip()
         
         # Initialize Vosk Model for Zero-Latency Stream 1c
         vosk.SetLogLevel(-1) # Disable verbose logs
@@ -130,7 +143,16 @@ class AudioCapturer:
             if p is None:
                 raise RuntimeError("WASAPI host was reset")
             self._microphone_pyaudio = p
-            device = p.get_default_input_device_info()
+            generation, _speaker_name, microphone_name = (
+                self._device_selection_snapshot()
+            )
+            default_device = p.get_default_input_device_info()
+            device = self._find_named_device(
+                p,
+                microphone_name,
+                input_device=True,
+                fallback=default_device,
+            )
             if int(device.get("maxInputChannels", 0)) < 1:
                 raise RuntimeError("default input device has no input channel")
 
@@ -170,6 +192,8 @@ class AudioCapturer:
 
             while self.is_running:
                 try:
+                    if generation != self._current_device_generation():
+                        raise RuntimeError("microphone selection changed")
                     if stream.get_read_available() < 1024:
                         time.sleep(0.005)
                         continue
@@ -334,20 +358,35 @@ class AudioCapturer:
 
             # Get default WASAPI output loopback device
             wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
-            default_speakers = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+            generation, speaker_name, _microphone_name = (
+                self._device_selection_snapshot()
+            )
+            default_speakers = p.get_device_info_by_index(
+                wasapi_info["defaultOutputDevice"]
+            )
+            selected_speakers = self._find_named_device(
+                p,
+                speaker_name,
+                output_device=True,
+                host_api_index=int(wasapi_info["index"]),
+                fallback=default_speakers,
+            )
 
             loopback_device = None
-            if not default_speakers["isLoopbackDevice"]:
+            if not selected_speakers["isLoopbackDevice"]:
                 for loopback in p.get_loopback_device_info_generator():
-                    if default_speakers["name"] in loopback["name"]:
+                    if self._device_names_match(
+                        selected_speakers["name"], loopback["name"]
+                    ):
                         loopback_device = loopback
                         break
             else:
-                loopback_device = default_speakers
+                loopback_device = selected_speakers
 
             if not loopback_device:
-                logger.warning("Could not find dedicated loopback device. Trying default output.")
-                loopback_device = default_speakers
+                raise RuntimeError(
+                    f"No loopback endpoint for '{selected_speakers['name']}'"
+                )
 
             logger.info(f"Connected WASAPI Loopback Device: '{loopback_device['name']}' ({int(loopback_device['defaultSampleRate'])}Hz)")
 
@@ -391,6 +430,8 @@ class AudioCapturer:
 
             while self.is_running:
                 try:
+                    if generation != self._current_device_generation():
+                        raise RuntimeError("speaker selection changed")
                     available_frames = stream.get_read_available()
                     if available_frames < 1024:
                         now = time.monotonic()
@@ -669,6 +710,119 @@ class AudioCapturer:
             if self.callback_audio_activity:
                 self.callback_audio_activity(False, 0.0)
         logger.info(f"Audio speech processing {'enabled' if enabled else 'paused'}.")
+
+    @staticmethod
+    def list_audio_devices() -> dict[str, list[dict]]:
+        """Return selectable Windows WASAPI endpoints without loopback duplicates."""
+        result = {"speakers": [], "microphones": []}
+        try:
+            import pyaudiowpatch as pyaudio
+
+            host = pyaudio.PyAudio()
+            try:
+                wasapi = host.get_host_api_info_by_type(pyaudio.paWASAPI)
+                host_index = int(wasapi["index"])
+                default_output = int(wasapi["defaultOutputDevice"])
+                default_input = int(wasapi["defaultInputDevice"])
+                for index in range(host.get_device_count()):
+                    device = host.get_device_info_by_index(index)
+                    if int(device.get("hostApi", -1)) != host_index:
+                        continue
+                    if device.get("isLoopbackDevice"):
+                        continue
+                    entry = {
+                        "index": int(device["index"]),
+                        "name": str(device["name"]).strip(),
+                    }
+                    if int(device.get("maxOutputChannels", 0)) > 0:
+                        result["speakers"].append(
+                            {**entry, "default": int(device["index"]) == default_output}
+                        )
+                    if int(device.get("maxInputChannels", 0)) > 0:
+                        result["microphones"].append(
+                            {**entry, "default": int(device["index"]) == default_input}
+                        )
+            finally:
+                host.terminate()
+        except Exception as error:
+            logger.warning(f"Could not enumerate WASAPI audio devices: {error}")
+        return result
+
+    @staticmethod
+    def resolve_device_name(devices: list[dict], preferred_name: str) -> str:
+        """Resolve a saved name, falling back to the current Windows default."""
+        preferred = preferred_name.strip()
+        if preferred:
+            for device in devices:
+                if device.get("name") == preferred:
+                    return preferred
+        for device in devices:
+            if device.get("default"):
+                return str(device.get("name", ""))
+        return str(devices[0].get("name", "")) if devices else ""
+
+    def select_devices(self, speaker_name: str, microphone_name: str) -> None:
+        """Reconnect active capture sessions to newly selected endpoints."""
+        with self._device_lock:
+            selected = (speaker_name.strip(), microphone_name.strip())
+            current = (
+                self._speaker_device_name,
+                self._microphone_device_name,
+            )
+            if selected == current:
+                return
+            self._speaker_device_name, self._microphone_device_name = selected
+            self._device_generation += 1
+        self._loopback_ready.clear()
+        logger.info(
+            "Audio devices changed: "
+            f"speaker='{selected[0]}', microphone='{selected[1]}'"
+        )
+
+    def _device_selection_snapshot(self) -> tuple[int, str, str]:
+        with self._device_lock:
+            return (
+                self._device_generation,
+                self._speaker_device_name,
+                self._microphone_device_name,
+            )
+
+    def _current_device_generation(self) -> int:
+        with self._device_lock:
+            return self._device_generation
+
+    @classmethod
+    def _find_named_device(
+        cls,
+        host,
+        preferred_name: str,
+        *,
+        input_device: bool = False,
+        output_device: bool = False,
+        host_api_index: int | None = None,
+        fallback: dict,
+    ) -> dict:
+        for index in range(host.get_device_count()):
+            device = host.get_device_info_by_index(index)
+            if host_api_index is not None and int(
+                device.get("hostApi", -1)
+            ) != host_api_index:
+                continue
+            if input_device and int(device.get("maxInputChannels", 0)) < 1:
+                continue
+            if output_device and int(device.get("maxOutputChannels", 0)) < 1:
+                continue
+            if cls._device_names_match(preferred_name, device.get("name", "")):
+                return device
+        return fallback
+
+    @staticmethod
+    def _device_names_match(first: str, second: str) -> bool:
+        def normalize(value: str) -> str:
+            cleaned = str(value).replace("[Loopback]", "").strip().casefold()
+            return " ".join(cleaned.split())
+
+        return bool(first) and normalize(first) == normalize(second)
 
     def stop_capture(self):
         self.is_running = False

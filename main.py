@@ -14,9 +14,12 @@ if sys.platform == "win32" and os.getenv("QT_QPA_PLATFORM") == "offscreen":
 
 # IMPORT CORE ENGINES FIRST TO PREVENT PYSIDE6 SHIBOKEN IMPORT BUGS WITH VOSK/REQUESTS
 from config import Config
+from core.app_settings import AppSettings
+from core.ai_provider import AIProviderRouter
 from core.audio_capturer import AudioCapturer
 from core.conversation_context import ConversationContext
 from core.gemini_client import GeminiClient
+from core.openai_client import OpenAIClient
 from core.latest_task_pool import LatestTaskPool
 from core.session_recorder import SessionRecorder
 from core.session_replay import ReplayEvent, SessionReplayTimeline
@@ -24,6 +27,7 @@ from core.session_transcript import SessionTranscript
 from core.translator_engine import TranslatorEngine
 from core.smart_reply_engine import SmartReplyEngine
 from core.stt_engine import STTEngine
+from core.user_profile import UserProfile
 import ctypes
 from utils.logger import logger
 
@@ -58,6 +62,12 @@ class AppController:
 
         self.app = QApplication(sys.argv)
         self.app.setApplicationName("English Call Assistant")
+        self.app_settings = AppSettings()
+        self.selected_openai_model = self.app_settings.load_openai_model()
+        (
+            self.selected_speaker_device,
+            self.selected_microphone_device,
+        ) = self.app_settings.load_audio_devices()
 
         # Set App Icon
         if os.path.exists(Config.ICON_PATH_ICO):
@@ -66,7 +76,9 @@ class AppController:
             self.app.setWindowIcon(QIcon(Config.ICON_PATH_PNG))
 
         self.app.setQuitOnLastWindowClosed(True)
-        self.overlay = OverlayWindow()
+        self.overlay = OverlayWindow(
+            selected_ai_model=self.selected_openai_model
+        )
         self._setup_activation_server()
         self._utterance_ids = count(1)
         self._conversation_context = ConversationContext()
@@ -101,20 +113,60 @@ class AppController:
 
         # Initialize Core Engines
         self.stt_engine = STTEngine(model_size="tiny.en")
-        # One shared Gemini client means translation and assistance share the
-        # same rate-limit circuit instead of independently hammering the API.
+        # All AI streams share provider circuits. OpenAI is preferred when its
+        # key is configured; Gemini and local logic remain graceful fallbacks.
+        self.openai_client = OpenAIClient(model=self.selected_openai_model)
         self.gemini_client = GeminiClient()
-        self.gemini_client.add_status_listener(
-            self.overlay.signal_ai_status.emit
+        self.ai_client = AIProviderRouter(
+            openai_client=self.openai_client,
+            gemini_client=self.gemini_client,
         )
-        self.translator = TranslatorEngine(gemini_client=self.gemini_client)
-        self.smart_reply = SmartReplyEngine(gemini_client=self.gemini_client)
+        self.ai_client.add_status_listener(
+            lambda state, message: self.overlay.signal_ai_status.emit(
+                state,
+                self.ai_client.active_provider_name,
+                message,
+            )
+        )
+        self.user_profile = UserProfile.load()
+        self.translator = TranslatorEngine(ai_client=self.ai_client)
+        self.smart_reply = SmartReplyEngine(
+            ai_client=self.ai_client,
+            user_profile=self.user_profile,
+        )
+        self.overlay.signal_ai_model_changed.connect(
+            self._handle_ai_model_changed
+        )
         self.audio_capturer = AudioCapturer(
             callback_on_speech=self.on_audio_received,
             stt_engine=self.stt_engine,
             callback_audio_activity=self.on_audio_activity_event,
             callback_partial_speech=self.on_partial_audio_received,
             callback_recording_audio=self._on_recording_audio,
+            speaker_device_name=self.selected_speaker_device,
+            microphone_device_name=self.selected_microphone_device,
+        )
+        available_audio_devices = AudioCapturer.list_audio_devices()
+        self.selected_speaker_device = AudioCapturer.resolve_device_name(
+            available_audio_devices["speakers"],
+            self.selected_speaker_device,
+        )
+        self.selected_microphone_device = AudioCapturer.resolve_device_name(
+            available_audio_devices["microphones"],
+            self.selected_microphone_device,
+        )
+        self.audio_capturer.select_devices(
+            self.selected_speaker_device,
+            self.selected_microphone_device,
+        )
+        self.overlay.set_audio_devices(
+            available_audio_devices["speakers"],
+            available_audio_devices["microphones"],
+            self.selected_speaker_device,
+            self.selected_microphone_device,
+        )
+        self.overlay.signal_audio_devices_changed.connect(
+            self._handle_audio_devices_changed
         )
 
     @classmethod
@@ -149,6 +201,44 @@ class AppController:
         self.overlay.raise_()
         self.overlay.activateWindow()
         logger.info("Existing app window activated by a second launch request.")
+
+    def _handle_ai_model_changed(self, model: str):
+        """Apply a validated model to future AI work and suppress stale UI."""
+        if model not in Config.OPENAI_MODEL_OPTIONS:
+            logger.warning(f"Ignored unsupported OpenAI model selection: {model}")
+            self.overlay.set_selected_ai_model(self.openai_client.model)
+            return
+        if model == self.openai_client.model:
+            return
+
+        invalidation_generation = next(self._utterance_ids)
+        for stream in ("translation", "contextual_translation", "assistance"):
+            self._task_pool.invalidate(stream, invalidation_generation)
+
+        self.openai_client.set_model(model)
+        self.selected_openai_model = model
+        self.app_settings.save_openai_model(model)
+        state, detail = self.ai_client.status_snapshot()
+        provider = self.ai_client.active_provider_name
+        self.overlay.signal_ai_status.emit(
+            state,
+            provider,
+            f"OpenAI model: {model}. {detail}",
+        )
+        logger.info(f"OpenAI model changed to {model}")
+
+    def _handle_audio_devices_changed(
+        self, speaker_device: str, microphone_device: str
+    ):
+        """Persist device choices and reconnect the live capture workers."""
+        self.selected_speaker_device = speaker_device
+        self.selected_microphone_device = microphone_device
+        self.app_settings.save_audio_devices(
+            speaker_device, microphone_device
+        )
+        self.audio_capturer.select_devices(
+            speaker_device, microphone_device
+        )
 
     def on_audio_activity_event(self, is_capturing: bool, volume: float):
         """Emits thread-safe signal to update visual audio indicator on top bar."""

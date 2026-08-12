@@ -11,14 +11,15 @@ import os
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QSlider, QGraphicsDropShadowEffect, QApplication, QCheckBox,
-    QAbstractButton, QAbstractSlider, QScrollBar
+    QAbstractButton, QAbstractSlider, QScrollBar, QComboBox, QToolButton, QMenu
 )
 
 from PySide6.QtCore import Qt, QPoint, QRect, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QColor, QIcon, QPixmap
 
 from config import Config
 from gui.components.glanceable_dashboard import GlanceableDashboard
+from gui.license_dialog import LicenseDialog
 from utils.logger import logger
 
 class OverlayWindow(QMainWindow):
@@ -48,19 +49,24 @@ class OverlayWindow(QMainWindow):
     )  # id, quick_en, quick_vi, full_en, full_vi, should_reply
     signal_audio_activity = Signal(bool, float)  # is_capturing, volume_energy
     signal_partial_speech = Signal(str)  # live word-by-word streaming text
-    signal_ai_status = Signal(str, str)  # state, user-facing detail
+    signal_ai_status = Signal(str, str, str)  # state, active provider, detail
+    signal_ai_model_changed = Signal(str)
+    signal_audio_devices_changed = Signal(str, str)
     signal_recording_toggled = Signal(bool)
     signal_replay_action = Signal(str)
     signal_export_requested = Signal()
 
 
-    def __init__(self):
+    def __init__(self, selected_ai_model: str | None = None):
         super().__init__()
         self.drag_position = QPoint()
         self.is_locked = False
         self._geometry_verified_after_show = False
         self._replay_button_state = "play"
         self._has_recording = False
+        self._selected_ai_model = selected_ai_model or Config.OPENAI_MODEL
+        self._selected_speaker_device = ""
+        self._selected_microphone_device = ""
         self.state_file = Config.WINDOW_STATE_PATH
         
         self.init_window_flags()
@@ -273,9 +279,60 @@ class OverlayWindow(QMainWindow):
         self.lbl_ai_status.setObjectName("AIStatus")
         self.lbl_ai_status.setFixedSize(54, 20)
         self.lbl_ai_status.setAlignment(Qt.AlignCenter)
-        self.lbl_ai_status.setAccessibleName("Trạng thái Gemini")
+        self.lbl_ai_status.setAccessibleName("Trạng thái AI online")
         st_layout.addWidget(self.lbl_ai_status)
-        self.set_ai_status("online", "Gemini sẵn sàng")
+        self.set_ai_status("off", "Local", "Đang dùng chế độ local")
+
+        self.combo_ai_model = QComboBox(self.status_title_box)
+        self.combo_ai_model.setObjectName("AIModelSelector")
+        self.combo_ai_model.setFixedSize(112, 22)
+        self.combo_ai_model.setCursor(Qt.PointingHandCursor)
+        self.combo_ai_model.setAccessibleName("Chọn model OpenAI")
+        model_presentations = {
+            "gpt-5.6-luna": ("5.6 Luna", "Chính xác nhất trong benchmark"),
+            "gpt-4.1-nano": ("4.1 Nano", "Nhanh nhất trong benchmark"),
+            "gpt-4.1-mini": ("4.1 Mini", "Model GPT-4.1 cỡ nhỏ"),
+            "gpt-5-nano": ("5 Nano", "Model GPT-5 tiết kiệm"),
+        }
+        for model in Config.OPENAI_MODEL_OPTIONS:
+            label, tooltip = model_presentations.get(model, (model, model))
+            self.combo_ai_model.addItem(label, model)
+            self.combo_ai_model.setItemData(
+                self.combo_ai_model.count() - 1,
+                f"{model} — {tooltip}",
+                Qt.ToolTipRole,
+            )
+        self.combo_ai_model.setStyleSheet("""
+            QComboBox {
+                color: #CBD5E1;
+                background: rgba(255, 255, 255, 0.08);
+                border: 1px solid rgba(255, 255, 255, 0.14);
+                border-radius: 5px;
+                padding: 2px 20px 2px 7px;
+                font-size: 9px;
+                font-weight: 700;
+            }
+            QComboBox:hover, QComboBox:focus {
+                border-color: rgba(56, 189, 248, 0.65);
+                background: rgba(56, 189, 248, 0.14);
+            }
+            QComboBox::drop-down {
+                width: 18px;
+                border: none;
+            }
+            QComboBox QAbstractItemView {
+                color: #E2E8F0;
+                background: #172033;
+                border: 1px solid #334155;
+                selection-background-color: #0E7490;
+                padding: 3px;
+            }
+        """)
+        self.set_selected_ai_model(self._selected_ai_model)
+        self.combo_ai_model.currentIndexChanged.connect(
+            self._on_ai_model_index_changed
+        )
+        st_layout.addWidget(self.combo_ai_model)
 
         # Visual Audio Activity Indicator (Shows 🔊 Catching Sound in real-time)
         self.lbl_audio_wave = QLabel("🎙 Ready", self.status_title_box)
@@ -343,6 +400,48 @@ class OverlayWindow(QMainWindow):
         self.btn_export.clicked.connect(self.signal_export_requested.emit)
         self.header_layout.addWidget(self.btn_export)
 
+        self.btn_audio_devices = QToolButton(self)
+        self.btn_audio_devices.setObjectName("AudioDeviceButton")
+        self.btn_audio_devices.setText("AUDIO")
+        self.btn_audio_devices.setPopupMode(QToolButton.InstantPopup)
+        self.btn_audio_devices.setFixedSize(42, 26)
+        self.btn_audio_devices.setCursor(Qt.PointingHandCursor)
+        self.btn_audio_devices.setAccessibleName("Chọn loa và microphone")
+        self.btn_audio_devices.setStyleSheet("""
+            QToolButton {
+                background-color: rgba(255, 255, 255, 0.08);
+                color: #CBD5E1;
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 6px;
+                font-size: 8px;
+                font-weight: 700;
+            }
+            QToolButton:hover {
+                background-color: rgba(56, 189, 248, 0.20);
+                border-color: rgba(56, 189, 248, 0.50);
+            }
+            QToolButton::menu-indicator { image: none; }
+        """)
+        self.audio_device_menu = QMenu(self.btn_audio_devices)
+        self.audio_device_menu.setAccessibleName("Danh sách thiết bị âm thanh")
+        self.audio_device_menu.setStyleSheet("""
+            QMenu {
+                color: #E2E8F0;
+                background: #172033;
+                border: 1px solid #334155;
+                padding: 5px;
+            }
+            QMenu::item { padding: 6px 24px 6px 9px; }
+            QMenu::item:selected { background: #0E7490; }
+            QMenu::item:disabled { color: #64748B; }
+        """)
+        self.speaker_device_menu = self.audio_device_menu.addMenu("Loa")
+        self.microphone_device_menu = self.audio_device_menu.addMenu(
+            "Microphone"
+        )
+        self.btn_audio_devices.setMenu(self.audio_device_menu)
+        self.header_layout.addWidget(self.btn_audio_devices)
+
         # Lock Position Toggle Button
         self.btn_lock = QPushButton("🔓", self)
         self.btn_lock.setCheckable(True)
@@ -369,6 +468,15 @@ class OverlayWindow(QMainWindow):
         """)
         self.btn_lock.toggled.connect(self.toggle_lock_position)
         self.header_layout.addWidget(self.btn_lock)
+
+        self.btn_about = QPushButton("ⓘ", self)
+        self.btn_about.setFixedSize(26, 26)
+        self.btn_about.setCursor(Qt.PointingHandCursor)
+        self.btn_about.setToolTip("License, privacy & third-party notices")
+        self.btn_about.setAccessibleName("Open license and privacy information")
+        self.btn_about.setStyleSheet(self._window_btn_style(hover_color="#38BDF8"))
+        self.btn_about.clicked.connect(self._show_license)
+        self.header_layout.addWidget(self.btn_about)
 
         # Window Opacity Slider
         self.lbl_win_op = QLabel("🪟", self)
@@ -528,6 +636,10 @@ class OverlayWindow(QMainWindow):
         self.signal_partial_speech.connect(self.dashboard.update_partial_speech)
         self.signal_ai_status.connect(self.set_ai_status)
 
+    def _show_license(self):
+        dialog = LicenseDialog(self)
+        dialog.exec()
+
 
 
     def on_audio_activity_changed(self, is_capturing: bool, volume: float):
@@ -557,24 +669,133 @@ class OverlayWindow(QMainWindow):
                 border-radius: 4px;
             """)
 
-    def set_ai_status(self, state: str, message: str):
+    def set_ai_status(self, state: str, provider: str, message: str):
         """Show degraded AI without moving or blocking the fixed reading zones."""
         presentations = {
-            "online": ("AI", "#86EFAC", "rgba(34,197,94,0.14)"),
-            "probing": ("AI RETRY", "#7DD3FC", "rgba(56,189,248,0.14)"),
-            "degraded": ("AI LOCAL", "#FDE68A", "rgba(245,158,11,0.16)"),
-            "local": ("AI LOCAL", "#FDE68A", "rgba(245,158,11,0.16)"),
-            "off": ("AI OFF", "#94A3B8", "rgba(148,163,184,0.12)"),
+            "online": ("#86EFAC", "rgba(34,197,94,0.14)"),
+            "probing": ("#7DD3FC", "rgba(56,189,248,0.14)"),
+            "degraded": ("#FDE68A", "rgba(245,158,11,0.16)"),
+            "local": ("#FDE68A", "rgba(245,158,11,0.16)"),
+            "off": ("#94A3B8", "rgba(148,163,184,0.12)"),
         }
-        label, color, background = presentations.get(
+        color, background = presentations.get(
             state, presentations["degraded"]
         )
+        normalized_provider = provider.strip().upper()
+        label = (
+            normalized_provider
+            if normalized_provider in {"OPENAI", "GEMINI", "LOCAL"}
+            else "AI"
+        )
         self.lbl_ai_status.setText(label)
+        self.lbl_ai_status.setAccessibleName(f"Dịch vụ AI đang dùng: {label}")
         self.lbl_ai_status.setToolTip(message)
         self.lbl_ai_status.setStyleSheet(
             f"color:{color};background:{background};"
             "border:1px solid rgba(255,255,255,0.10);border-radius:4px;"
             "font-size:8px;font-weight:700;"
+        )
+
+    def set_selected_ai_model(self, model: str) -> None:
+        """Synchronize the selector without treating setup as a user change."""
+        index = self.combo_ai_model.findData(model)
+        if index < 0:
+            index = 0
+        self.combo_ai_model.blockSignals(True)
+        self.combo_ai_model.setCurrentIndex(index)
+        self.combo_ai_model.blockSignals(False)
+        self._selected_ai_model = str(self.combo_ai_model.currentData())
+        self.combo_ai_model.setToolTip(
+            f"OpenAI model đang chọn: {self._selected_ai_model}"
+        )
+
+    def _on_ai_model_index_changed(self, _index: int) -> None:
+        model = str(self.combo_ai_model.currentData() or "")
+        if not model or model == self._selected_ai_model:
+            return
+        self._selected_ai_model = model
+        self.combo_ai_model.setToolTip(f"OpenAI model đang chọn: {model}")
+        self.signal_ai_model_changed.emit(model)
+
+    def set_audio_devices(
+        self,
+        speakers: list[dict],
+        microphones: list[dict],
+        selected_speaker: str,
+        selected_microphone: str,
+    ) -> None:
+        """Populate stable audio menus and mark the active endpoints."""
+        self._selected_speaker_device = selected_speaker
+        self._selected_microphone_device = selected_microphone
+        self.speaker_device_menu.clear()
+        self.microphone_device_menu.clear()
+        self._speaker_action_group = QActionGroup(self)
+        self._speaker_action_group.setExclusive(True)
+        self._microphone_action_group = QActionGroup(self)
+        self._microphone_action_group.setExclusive(True)
+
+        self._populate_audio_device_menu(
+            self.speaker_device_menu,
+            self._speaker_action_group,
+            speakers,
+            selected_speaker,
+            "speaker",
+        )
+        self._populate_audio_device_menu(
+            self.microphone_device_menu,
+            self._microphone_action_group,
+            microphones,
+            selected_microphone,
+            "microphone",
+        )
+        self._update_audio_device_tooltip()
+
+    def _populate_audio_device_menu(
+        self,
+        menu: QMenu,
+        action_group: QActionGroup,
+        devices: list[dict],
+        selected_name: str,
+        device_kind: str,
+    ) -> None:
+        if not devices:
+            unavailable = QAction("Không tìm thấy thiết bị", menu)
+            unavailable.setEnabled(False)
+            menu.addAction(unavailable)
+            return
+        for device in devices:
+            name = str(device.get("name", "")).strip()
+            if not name:
+                continue
+            label = f"{name} (mặc định)" if device.get("default") else name
+            action = QAction(label, menu)
+            action.setCheckable(True)
+            action.setChecked(name == selected_name)
+            action.setData(name)
+            action_group.addAction(action)
+            menu.addAction(action)
+            action.triggered.connect(
+                lambda checked, chosen=name, kind=device_kind: (
+                    self._select_audio_device(kind, chosen) if checked else None
+                )
+            )
+
+    def _select_audio_device(self, device_kind: str, name: str) -> None:
+        if device_kind == "speaker":
+            self._selected_speaker_device = name
+        else:
+            self._selected_microphone_device = name
+        self._update_audio_device_tooltip()
+        self.signal_audio_devices_changed.emit(
+            self._selected_speaker_device,
+            self._selected_microphone_device,
+        )
+
+    def _update_audio_device_tooltip(self) -> None:
+        speaker = self._selected_speaker_device or "Mặc định Windows"
+        microphone = self._selected_microphone_device or "Mặc định Windows"
+        self.btn_audio_devices.setToolTip(
+            f"Loa cần nghe: {speaker}\nMicrophone: {microphone}"
         )
 
     def set_recording_state(self, active: bool, recording_path: str = ""):
@@ -767,7 +988,13 @@ class OverlayWindow(QMainWindow):
     def _is_interactive_child_at(self, position: QPoint) -> bool:
         """Return whether a mouse control owns this client position."""
         widget = self.childAt(position)
-        interactive_types = (QAbstractButton, QAbstractSlider, QScrollBar)
+        interactive_types = (
+            QAbstractButton,
+            QAbstractSlider,
+            QScrollBar,
+            QComboBox,
+            QToolButton,
+        )
         while widget is not None and widget is not self:
             if isinstance(widget, interactive_types) and widget.isEnabled():
                 return True

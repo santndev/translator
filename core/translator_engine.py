@@ -5,14 +5,15 @@ Handles Stream 1a (Realtime EN->VI Translation) and Stream 1b (Vietnamese Meanin
 import urllib.parse
 import urllib.request
 import json
+import re
 from utils.logger import logger
 
 from core.dynamic_ai_generator import DynamicAIGenerator
-from core.gemini_client import GeminiClient
+from core.ai_provider import AIProviderRouter
 
 class TranslatorEngine:
-    CONTEXT_TRANSLATION_MAX_CHARS = 700
-    CONTEXT_TRANSLATION_MAX_UTTERANCES = 10
+    CONTEXT_TRANSLATION_MAX_CHARS = 600
+    CONTEXT_TRANSLATION_MAX_UTTERANCES = 6
     KEYWORD_GLOSSARY = {
         "api": "giao diện lập trình",
         "architecture": "kiến trúc",
@@ -57,11 +58,11 @@ class TranslatorEngine:
         "websocket": "kết nối hai chiều",
     }
 
-    def __init__(self, gemini_client=None):
+    def __init__(self, gemini_client=None, *, ai_client=None):
         # Free Google Translate RPC Endpoint
         self.gt_url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=vi&dt=t&q="
-        self.gemini = gemini_client or GeminiClient()
-        self.ai_generator = DynamicAIGenerator(gemini_client=self.gemini)
+        self.ai = ai_client or gemini_client or AIProviderRouter()
+        self.ai_generator = DynamicAIGenerator(ai_client=self.ai)
 
     def translate_en_to_vi(self, english_text: str) -> str:
         """
@@ -87,27 +88,37 @@ class TranslatorEngine:
             return ""
 
         newest_text = context[-1]
-        if not self.gemini.is_configured:
+        if not self.ai.is_configured:
             return self.translate_en_to_vi(newest_text)
 
-        dialogue = "\n".join(
-            f"{index + 1}. {text}" for index, text in enumerate(context)
-        )
+        prior_context = "\n".join(context[:-1]) or "(none)"
         prompt = (
-            "Translate only the FINAL line of this recent English conversation "
-            "into natural Vietnamese for quick reading. Use all earlier lines "
-            "only to resolve pronouns, omitted subjects, terminology, and "
-            "sentence fragments. Make the final translation understandable "
-            "on its own, but do not repeat or summarize earlier turns. "
+            "Translate the text under LATEST TEXT into natural Vietnamese for "
+            "quick reading. PRIOR CONTEXT is reference only: never translate or "
+            "summarize it. If LATEST TEXT completes an unfinished sentence in "
+            "PRIOR CONTEXT, reconstruct that complete sentence in Vietnamese. "
+            "Otherwise translate only LATEST TEXT. Resolve pronouns, omitted "
+            "subjects, terminology, and sentence fragments so the result is "
+            "understandable on its own. "
             "Preserve technical meaning, SQL/code/identifiers, and punctuation "
             "that belongs to code. Translate ordinary technical prose naturally "
             "from context rather than applying a fixed glossary. Do not explain, "
             "summarize, or add facts. Return Vietnamese text only.\n\n"
-            f"{dialogue}"
+            f"PRIOR CONTEXT (REFERENCE ONLY):\n{prior_context}\n\n"
+            f"LATEST TEXT (TRANSLATE THIS):\n{newest_text}"
         )
         try:
-            return self.gemini.generate_text(
-                prompt, max_output_tokens=1200, thinking_level="minimal"
+            translated = self.ai.generate_text(
+                prompt,
+                max_output_tokens=300,
+                reasoning_effort="none",
+                thinking_level="minimal",
+            ).strip()
+            return re.sub(
+                r"^\s*(?:REMOTE|YOU|BẠN|TỪ XA)\s*:\s*",
+                "",
+                translated,
+                flags=re.IGNORECASE,
             ).strip()
         except Exception as error:
             logger.warning(
