@@ -25,6 +25,16 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt "pyinstaller>=6.10.0"
 
+      - name: Cache faster-whisper model
+        uses: actions/cache@v4
+        with:
+          path: ~\.cache\huggingface\hub
+          key: faster-whisper-tiny-en-${{ runner.os }}
+
+      - name: Download faster-whisper model
+        shell: pwsh
+        run: python -c "from faster_whisper import WhisperModel; WhisperModel('tiny.en')"
+
       - name: Read version from tag
         shell: pwsh
         run: |
