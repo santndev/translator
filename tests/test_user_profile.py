@@ -28,6 +28,19 @@ def test_birth_year_only_does_not_guess_an_exact_age():
     assert "26 years old" not in reply.english
 
 
+def test_invalid_birth_date_does_not_discard_other_profile_fields():
+    profile = UserProfile.from_mapping(
+        {
+            "preferred_name": "Minh",
+            "birth_date": "02-April",
+            "birth_year": 2000,
+        }
+    )
+
+    assert profile.try_answer("What's your name?").english == "My name is Minh."
+    assert profile.try_answer("How old are you?").english == "I was born in 2000."
+
+
 class FailingCloud:
     is_configured = True
     model = "must-not-be-called"
@@ -53,6 +66,41 @@ def test_profile_question_bypasses_cloud_for_low_latency():
     assert result["stream_2b_vi"] == "Tên tôi là Minh."
     assert result["stream_2b_should_reply"] is True
     assert cloud.calls == 0
+
+
+class SelfAnsweredCloud:
+    is_configured = True
+    model = "test-model"
+
+    def __init__(self):
+        self.calls = 0
+
+    def generate_json(self, *_args, **_kwargs):
+        self.calls += 1
+        return {
+            "stream_1b": "Người nói đã tự giới thiệu tên.",
+            "stream_2a": "name — tên",
+            "stream_2b_quick_en": "",
+            "stream_2b_quick_vi": "",
+            "stream_2b_en": "",
+            "stream_2b_vi": "",
+            "stream_2b_should_reply": False,
+        }
+
+
+def test_profile_does_not_answer_a_self_answered_training_question():
+    cloud = SelfAnsweredCloud()
+    profile = UserProfile.from_mapping(
+        {"preferred_name": "Minh", "cloud_shareable_fields": []}
+    )
+
+    result = DynamicAIGenerator(cloud, user_profile=profile).generate_all_streams(
+        "What's your name? My name is Esther."
+    )
+
+    assert result["stream_2b_should_reply"] is False
+    assert result["stream_2b_en"] == ""
+    assert cloud.calls == 1
 
 
 def test_cloud_context_contains_only_explicitly_shareable_fields():

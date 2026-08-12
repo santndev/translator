@@ -7,7 +7,7 @@ import sys
 class Config:
     # --- App Info ---
     APP_NAME = "English Call Assistant & Overlay"
-    VERSION = "1.0.3"
+    VERSION = "1.0.4"
     # PyInstaller exposes bundled read-only resources through _MEIPASS. Runtime
     # state must live outside Program Files so standard Windows users can write it.
     BASE_DIR = getattr(
@@ -22,6 +22,7 @@ class Config:
     DATA_DIR = os.path.join(LOCAL_APP_DATA, "Translator")
     LOG_DIR = os.path.join(DATA_DIR, "Logs")
     WINDOW_STATE_PATH = os.path.join(DATA_DIR, "window_state.json")
+    APP_SETTINGS_PATH = os.path.join(DATA_DIR, "app_settings.json")
     USER_PROFILE_PATH = os.getenv(
         "TRANSLATOR_USER_PROFILE_PATH",
         os.path.join(DATA_DIR, "user_profile.json"),
@@ -59,6 +60,12 @@ class Config:
     GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
     TRANSLATOR_OPENAI_API_KEY = os.getenv("TRANSLATOR_OPENAI_API_KEY", "")
     OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
+    OPENAI_MODEL_OPTIONS = (
+        "gpt-5.6-luna",
+        "gpt-4.1-nano",
+        "gpt-4.1-mini",
+        "gpt-5-nano",
+    )
     OPENAI_API_BASE = os.getenv(
         "OPENAI_API_BASE", "https://api.openai.com/v1"
     ).rstrip("/")

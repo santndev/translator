@@ -739,6 +739,63 @@ def verify_session_controls_have_stable_states_and_accessible_names():
     assert requested_actions == ["play", "pause", "stop"]
 
 
+def verify_ai_model_selector_changes_only_on_user_selection():
+    overlay = OverlayWindow(selected_ai_model="gpt-4.1-nano")
+    assert overlay.combo_ai_model.currentData() == "gpt-4.1-nano"
+    assert overlay.combo_ai_model.accessibleName() == "Chọn model OpenAI"
+    assert overlay.combo_ai_model.count() == 4
+
+    changes = []
+    overlay.signal_ai_model_changed.connect(changes.append)
+    overlay.set_selected_ai_model("gpt-4.1-mini")
+    assert changes == []
+
+    overlay.combo_ai_model.setCurrentIndex(
+        overlay.combo_ai_model.findData("gpt-5-nano")
+    )
+    QApplication.processEvents()
+    assert changes == ["gpt-5-nano"]
+    assert "gpt-5-nano" in overlay.combo_ai_model.toolTip()
+
+
+def verify_audio_device_menu_lists_and_emits_selected_endpoints():
+    overlay = OverlayWindow()
+    speakers = [
+        {"name": "Monitor", "default": False},
+        {"name": "USB Speakers", "default": True},
+    ]
+    microphones = [
+        {"name": "USB Microphone", "default": True},
+        {"name": "Webcam Microphone", "default": False},
+    ]
+    overlay.set_audio_devices(
+        speakers,
+        microphones,
+        "USB Speakers",
+        "USB Microphone",
+    )
+
+    assert overlay.btn_audio_devices.accessibleName() == (
+        "Chọn loa và microphone"
+    )
+    assert len(overlay.speaker_device_menu.actions()) == 2
+    assert len(overlay.microphone_device_menu.actions()) == 2
+    assert "USB Speakers" in overlay.btn_audio_devices.toolTip()
+
+    changes = []
+    overlay.signal_audio_devices_changed.connect(
+        lambda speaker, microphone: changes.append((speaker, microphone))
+    )
+    monitor_action = next(
+        action
+        for action in overlay.speaker_device_menu.actions()
+        if action.data() == "Monitor"
+    )
+    monitor_action.trigger()
+    QApplication.processEvents()
+    assert changes == [("Monitor", "USB Microphone")]
+
+
 if __name__ == "__main__":
     app = QApplication.instance() or QApplication([])
     verify_grid_positions()
@@ -768,6 +825,8 @@ if __name__ == "__main__":
     verify_overlay_signals_preserve_ids()
     verify_offscreen_window_state_is_clamped()
     verify_session_controls_have_stable_states_and_accessible_names()
+    verify_ai_model_selector_changes_only_on_user_selection()
+    verify_audio_device_menu_lists_and_emits_selected_endpoints()
     verify_remote_labels_become_icons_in_conversation_views()
     verify_empty_regions_do_not_show_processing_status()
     app.processEvents()

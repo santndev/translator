@@ -1,4 +1,4 @@
-"""Tests for the slower three-utterance contextual translation path."""
+"""Tests for the slower bounded contextual translation path."""
 
 from config import Config
 from core.translator_engine import TranslatorEngine

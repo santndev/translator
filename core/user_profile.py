@@ -123,25 +123,41 @@ class UserProfile:
 
         birth_date = raw.get("birth_date")
         if isinstance(birth_date, str) and birth_date.strip():
-            parsed_date = date.fromisoformat(birth_date.strip())
-            if parsed_date > date.today() or parsed_date.year < 1900:
-                raise ValueError("birth_date is outside the supported range")
-            values["birth_date"] = parsed_date
-            values["birth_year"] = parsed_date.year
-        else:
+            try:
+                parsed_date = date.fromisoformat(birth_date.strip())
+                if parsed_date > date.today() or parsed_date.year < 1900:
+                    raise ValueError("outside the supported range")
+                values["birth_date"] = parsed_date
+                values["birth_year"] = parsed_date.year
+            except ValueError:
+                logger.warning(
+                    "Ignored invalid user profile field 'birth_date'; "
+                    "expected YYYY-MM-DD."
+                )
+        if "birth_date" not in values:
             birth_year = raw.get("birth_year")
             if birth_year is not None and birth_year != "":
-                year = int(birth_year)
-                if year < 1900 or year > date.today().year:
-                    raise ValueError("birth_year is outside the supported range")
-                values["birth_year"] = year
+                try:
+                    year = int(birth_year)
+                    if year < 1900 or year > date.today().year:
+                        raise ValueError("outside the supported range")
+                    values["birth_year"] = year
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Ignored invalid user profile field 'birth_year'."
+                    )
 
         experience = raw.get("years_experience")
         if experience is not None and experience != "":
-            years = int(experience)
-            if not 0 <= years <= 80:
-                raise ValueError("years_experience is outside the supported range")
-            values["years_experience"] = years
+            try:
+                years = int(experience)
+                if not 0 <= years <= 80:
+                    raise ValueError("outside the supported range")
+                values["years_experience"] = years
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Ignored invalid user profile field 'years_experience'."
+                )
 
         custom_facts = raw.get("custom_facts", {})
         if isinstance(custom_facts, dict):

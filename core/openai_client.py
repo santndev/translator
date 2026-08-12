@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import urllib.error
@@ -44,8 +45,9 @@ class OpenAIClient:
         urlopen=None,
         clock=None,
     ):
+        self._lock = threading.RLock()
         self._api_key_override = api_key
-        self.model = model or Config.OPENAI_MODEL
+        self._model = model or Config.OPENAI_MODEL
         self.api_base = (api_base or Config.OPENAI_API_BASE).rstrip("/")
         self.timeout_seconds = (
             Config.OPENAI_TIMEOUT_SECONDS
@@ -54,7 +56,6 @@ class OpenAIClient:
         )
         self._urlopen = urlopen or urllib.request.urlopen
         self._clock = clock or time.monotonic
-        self._lock = threading.RLock()
         self._listeners = []
         self._consecutive_failures = 0
         self._open_until = 0.0
@@ -80,6 +81,31 @@ class OpenAIClient:
     @property
     def provider_name(self) -> str:
         return "OpenAI"
+
+    @property
+    def model(self) -> str:
+        with self._lock:
+            return self._model
+
+    def set_model(self, model: str) -> None:
+        """Switch future requests to a new model and reset stale cooldown state."""
+        selected = model.strip() if isinstance(model, str) else ""
+        if not selected:
+            raise ValueError("OpenAI model must be a non-empty string")
+        with self._lock:
+            if selected == self._model:
+                return
+            self._model = selected
+            self._consecutive_failures = 0
+            self._open_until = 0.0
+            state = "online" if self.is_configured else "off"
+            message = (
+                f"OpenAI {selected} sẵn sàng"
+                if self.is_configured
+                else "Chưa cấu hình OpenAI"
+            )
+            notify = self._set_status_locked(state, message)
+        self._notify(notify)
 
     def add_status_listener(self, listener, *, emit_current: bool = True):
         with self._lock:
@@ -161,9 +187,23 @@ class OpenAIClient:
             )
 
         effort = (reasoning_effort or Config.OPENAI_REASONING_EFFORT).lower()
-        if effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
+        if effort not in {
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        }:
             effort = "none"
-        text_config: dict = {"verbosity": "low"}
+        model = self.model
+        supports_gpt5_controls = bool(
+            re.match(r"^gpt-5(?:[.-]|$)", model.lower())
+        )
+        text_config: dict = {}
+        if supports_gpt5_controls:
+            text_config["verbosity"] = "low"
         if json_schema is None:
             text_config["format"] = {"type": "text"}
         else:
@@ -174,15 +214,23 @@ class OpenAIClient:
                 "schema": json_schema,
             }
 
+        request_payload = {
+            "model": model,
+            "input": prompt,
+            "max_output_tokens": max_output_tokens,
+            "text": text_config,
+            "store": False,
+        }
+        if supports_gpt5_controls:
+            if re.match(r"^gpt-5(?:-(?:mini|nano))?$", model.lower()):
+                if effort == "none":
+                    effort = "minimal"
+                elif effort in {"xhigh", "max"}:
+                    effort = "high"
+            request_payload["reasoning"] = {"effort": effort}
+
         payload = json.dumps(
-            {
-                "model": self.model,
-                "input": prompt,
-                "max_output_tokens": max_output_tokens,
-                "reasoning": {"effort": effort},
-                "text": text_config,
-                "store": False,
-            },
+            request_payload,
             ensure_ascii=False,
         ).encode("utf-8")
         request = urllib.request.Request(

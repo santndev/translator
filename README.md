@@ -1,5 +1,7 @@
 # Translator
 
+Author: solesantn@gmail.com
+
 Translator is a real-time English-to-Vietnamese Windows call assistant. It
 captures system audio and optionally microphone audio, then presents English
 transcription, Vietnamese translation, conversation context, keywords, and a

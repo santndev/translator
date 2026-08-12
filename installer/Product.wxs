@@ -17,6 +17,7 @@
     <MajorUpgrade
         DowngradeErrorMessage="A newer version of Translator is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="medium" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.ProjectRoot)\installer\License.rtf" />
 
     <Icon Id="TranslatorIcon" SourceFile="$(var.ProjectRoot)\assets\app_icon.ico" />
     <Property Id="ARPPRODUCTICON" Value="TranslatorIcon" />

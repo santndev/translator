@@ -73,6 +73,75 @@ def test_openai_client_uses_responses_structured_output_without_storing_data():
     assert captured["body"]["text"]["format"]["schema"] == schema
 
 
+def test_openai_client_omits_gpt5_only_controls_for_gpt_4_1():
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return response_with_text('{"ok": true}')
+
+    client = OpenAIClient(
+        api_key="secret-key",
+        model="gpt-4.1-mini",
+        urlopen=fake_urlopen,
+    )
+
+    assert client.generate_json("test") == {"ok": True}
+    assert "reasoning" not in captured["body"]
+    assert "verbosity" not in captured["body"]["text"]
+    assert captured["body"]["model"] == "gpt-4.1-mini"
+
+
+def test_openai_client_maps_none_to_minimal_for_gpt5_nano():
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return response_with_text('{"ok": true}')
+
+    client = OpenAIClient(
+        api_key="secret-key",
+        model="gpt-5-nano",
+        urlopen=fake_urlopen,
+    )
+
+    assert client.generate_json("test", reasoning_effort="none") == {"ok": True}
+    assert captured["body"]["reasoning"] == {"effort": "minimal"}
+
+
+def test_openai_client_switches_model_for_future_requests():
+    captured_models = []
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        captured_models.append(
+            json.loads(request.data.decode("utf-8"))["model"]
+        )
+        return response_with_text("ok")
+
+    client = OpenAIClient(
+        api_key="secret-key",
+        model="gpt-5.6-luna",
+        urlopen=fake_urlopen,
+    )
+
+    assert client.generate_text("first") == "ok"
+    client.set_model("gpt-4.1-nano")
+    assert client.generate_text("second") == "ok"
+
+    assert captured_models == ["gpt-5.6-luna", "gpt-4.1-nano"]
+    assert client.model == "gpt-4.1-nano"
+
+
+def test_openai_client_rejects_empty_runtime_model():
+    client = OpenAIClient(api_key="secret-key")
+
+    with pytest.raises(ValueError, match="non-empty"):
+        client.set_model("  ")
+
+
 def test_openai_rate_limit_opens_circuit_and_recovers():
     now = [100.0]
     calls = []
